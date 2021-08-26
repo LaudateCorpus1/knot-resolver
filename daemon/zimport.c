@@ -72,9 +72,14 @@ struct zone_import_ctx {
 	zi_callback cb;
 	void *cb_param;
 
-	uint8_t *digest_buf;
+	uint8_t *digest_buf; /// temporary buffer for digest computation (on pool)
 	#define DIGEST_BUF_SIZE (64*1024 - 1)
-	dnssec_digest_ctx_t *digest_ctx;
+	#define DIGEST_ALG_COUNT 2
+	struct {
+		bool active; /// whether we want it computed
+		dnssec_digest_ctx_t *ctx;
+		const uint8_t *expected; /// expected digest (inside zonemd on pool)
+	} digests[DIGEST_ALG_COUNT]; /// we use indices 0 and 1 for SHA 384 and 512
 };
 
 typedef struct zone_import_ctx zone_import_ctx_t;
@@ -112,43 +117,161 @@ static int digest_rrset(trie_val_t *rr_p, void *z_import_v)
 	if (is_apex && kr_rrset_type_maysig(rr) == KNOT_RRTYPE_ZONEMD)
 		return KNOT_EOK;
 
-	int ret = knot_rrset_to_wire_extra(rr, z_import->digest_buf, DIGEST_BUF_SIZE,
-					   0, NULL, KNOT_PF_ORIGTTL);
-	if (ret < 0)
-		return ret;
+	const int len = knot_rrset_to_wire_extra(rr, z_import->digest_buf, DIGEST_BUF_SIZE,
+						 0, NULL, KNOT_PF_ORIGTTL);
+	if (len < 0)
+		return kr_error(len);
 
 	// digest serialized RRSet
-	dnssec_binary_t bufbin = { ret, z_import->digest_buf };
-	return dnssec_digest(z_import->digest_ctx, &bufbin);
+	for (int i = 0; i < DIGEST_ALG_COUNT; ++i) {
+		if (!z_import->digests[i].active)
+			continue;
+		dnssec_binary_t bufbin = { len, z_import->digest_buf };
+		int ret = dnssec_digest(z_import->digests[i].ctx, &bufbin);
+		if (ret != KNOT_EOK)
+			return kr_error(ret);
+	}
+	return KNOT_EOK;
 }
 
+/** Verify ZONEMD in the stored zone, and return error code.
+ *
+ * All conditions are verified *except* for DNSSEC (not even for ZONEMD itself):
+   https://www.rfc-editor.org/rfc/rfc8976.html#name-verifying-zone-digest
+ */
 static int zonemd_verify(zone_import_ctx_t *z_import)
 {
-	const int algorithm = KNOT_ZONEMD_ALORITHM_SHA384; // FIXME
+	// Find zonemd RR
+	knot_rrset_t *rr_zonemd = NULL;
+	{
+		char key_buf[KEY_LEN], *key;
+		const int len = key_get(key_buf, z_import->origin,
+					KNOT_RRTYPE_ZONEMD, 0, &key);
+		if (len < 0)
+			return kr_error(len);
+		const trie_val_t *rr_p = trie_get_try(z_import->rrsets, key, len);
+		if (rr_p) {
+			rr_zonemd = *rr_p;
+			if (kr_fails_assert(rr_zonemd))
+				return kr_error(EINVAL);
+		} else {
+			// no zonemd; let's compute digest and throw an error afterwards
+			z_import->digests[KNOT_ZONEMD_ALORITHM_SHA384 - 1].active = true;
+			//z_import->digests[KNOT_ZONEMD_ALORITHM_SHA512 - 1].active = true;
+			goto do_digest;
+		}
+	}
+	// Get SOA serial
+	uint32_t soa_serial = -1;
+	{
+		char key_buf[KEY_LEN], *key;
+		const int len = key_get(key_buf, z_import->origin,
+					KNOT_RRTYPE_SOA, 0, &key);
+		if (len < 0)
+			return kr_error(len);
+		const trie_val_t *rr_p = trie_get_try(z_import->rrsets, key, len);
+		if (!rr_p) {
+			kr_log_error(ZIMPORT, "SOA record not found\n");
+			return kr_error(ENOENT);
+		}
+		const knot_rrset_t *soa = *rr_p;
+		if (kr_fails_assert(soa))
+			return kr_error(EINVAL);
+		if (soa->rrs.count != 1) {
+			kr_log_error(ZIMPORT, "the SOA RR set is weird\n");
+			return kr_error(EINVAL);
+		} // length is checked by parser already
+		soa_serial = knot_soa_serial(soa->rrs.rdata);
+	}
+	// Figure out SOA+ZONEMD RR contents.
+	bool some_active = false;
+	knot_rdata_t *rd = rr_zonemd->rrs.rdata;
+	for (int i = 0; i < rr_zonemd->rrs.count; ++i, rd = knot_rdataset_next(rd)) {
+		if (rd->len < 6 || knot_zonemd_scheme(rd) != KNOT_ZONEMD_SCHEME_SIMPLE
+		    || knot_zonemd_soa_serial(rd) != soa_serial)
+			continue;
+		const int algo = knot_zonemd_algorithm(rd);
+		if (algo != KNOT_ZONEMD_ALORITHM_SHA384 && algo != KNOT_ZONEMD_ALORITHM_SHA512)
+			continue;
+		if (rd->len != 6 + knot_zonemd_digest_size(rd)) {
+			kr_log_error(ZIMPORT, "ZONEMD record has incorrect digest length\n");
+			return kr_error(EINVAL);
+		}
+		if (z_import->digests[algo - 1].active) {
+			kr_log_error(ZIMPORT, "multiple clashing ZONEMD records found\n");
+			return kr_error(EINVAL);
+		}
+		some_active = true;
+		z_import->digests[algo - 1].active = true;
+		z_import->digests[algo - 1].expected = knot_zonemd_digest(rd);
+	}
+	if (!some_active) {
+		kr_log_error(ZIMPORT, "ZONEMD record(s) found but none were usable\n");
+		return kr_error(ENOENT);
+	}
+do_digest:
+	// Init memory, etc.
 	if (!z_import->digest_buf) {
 		z_import->digest_buf = mm_alloc(&z_import->pool, DIGEST_BUF_SIZE);
 		if (!z_import->digest_buf)
 			return kr_error(ENOMEM);
 	}
-	int ret = dnssec_digest_init(algorithm, &z_import->digest_ctx);
-	if (ret != DNSSEC_EOK)
+	for (int i = 0; i < DIGEST_ALG_COUNT; ++i) {
+		const int algo = i + 1;
+		if (!z_import->digests[i].active)
+			continue;
+		int ret = dnssec_digest_init(algo, &z_import->digests[i].ctx);
+		if (ret != KNOT_EOK) {
+			// free previous successful _ctx, if applicable
+			dnssec_binary_t digest = { 0 };
+			while (--i >= 0) {
+				if (z_import->digests[i].active)
+					dnssec_digest_finish(z_import->digests[i].ctx,
+								&digest);
+			}
+			return kr_error(ENOMEM);
+		}
+	}
+	// Actually compute the digest(s).
+	int ret = trie_apply(z_import->rrsets, digest_rrset, z_import);
+	dnssec_binary_t digests[DIGEST_ALG_COUNT] = { 0 };
+	for (int i = 0; i < DIGEST_ALG_COUNT; ++i) {
+		if (!z_import->digests[i].active)
+			continue;
+		int ret2 = dnssec_digest_finish(z_import->digests[i].ctx, &digests[i]);
+		if (ret == DNSSEC_EOK)
+			ret = ret2;
+		// we need to keep going to free all the _ctx
+	}
+	if (ret != DNSSEC_EOK) { // TODO: additional error logging?
+		for (int i = 0; i < DIGEST_ALG_COUNT; ++i)
+			free(digests[i].data);
 		return kr_error(ret);
-	int trie_ret = trie_apply(z_import->rrsets, digest_rrset, z_import);
-	dnssec_binary_t digest = { 0 };
-	ret = dnssec_digest_finish(z_import->digest_ctx, &digest); // we need this to free _ctx
-	if (trie_ret)
-		return kr_error(trie_ret);
-	if (ret != DNSSEC_EOK)
-		return kr_error(ret);
+	}
+	// Now only check that one of the hashes match.
+	bool has_match = false;
+	for (int i = 0; i < DIGEST_ALG_COUNT; ++i) {
+		if (!z_import->digests[i].active)
+			continue;
+		if (!z_import->digests[i].expected) {
+			kr_log_error(ZIMPORT, "no ZONEMD found; computed hash:\n");
+		} else if (memcmp(z_import->digests[i].expected, digests[i].data,
+					digests[i].size) != 0) {
+			kr_log_info(ZIMPORT, "ZONEMD hash mismatch; computed hash:\n");
+		} else {
+			kr_log_debug(ZIMPORT, "ZONEMD hash matches\n");
+			has_match = true;
+			continue;
+		}
+		// TODO: better printing
+		for (ssize_t j = 0; j < digests[i].size; ++j)
+			fprintf(stderr, "%02x", digests[i].data[j]);
+		fprintf(stderr, "\n");
+	}
 
-	// FIXME: temporary
-	printf("\n");
-	for (ssize_t i = 0; i < digest.size; ++i)
-		printf("%02x", digest.data[i]);
-	printf("\n");
-
-	free(digest.data);
-	return kr_ok();
+	for (int i = 0; i < DIGEST_ALG_COUNT; ++i)
+		free(digests[i].data);
+	return has_match ? kr_ok() : kr_error(ENOENT);
 }
 
 
@@ -180,6 +303,8 @@ static int zi_reset(struct zone_import_ctx *z_import, size_t rrset_sorted_list_s
 	z_import->rrset_idx = 0;
 	z_import->pool.alloc = (knot_mm_alloc_t) mp_alloc;
 	z_import->rrsets = trie_create(&z_import->pool);
+
+	memset(z_import->digests, 0, sizeof(z_import->digests));
 
 	array_init(z_import->rrset_sorted);
 
@@ -872,6 +997,7 @@ int zi_zone_import(struct zone_import_ctx *z_import,
 		return ret;
 	}
 
+	// FIXME: DNSSEC verify the ZONEMD RR set before this.
 	ret = zonemd_verify(z_import);
 	if (ret) return ret;
 
