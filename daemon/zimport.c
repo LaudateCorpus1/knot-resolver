@@ -39,6 +39,7 @@
 #include <ucw/mempool.h>
 #include <libknot/rrset.h>
 #include <libzscanner/scanner.h>
+#include <libdnssec/digest.h>
 
 #include "lib/utils.h"
 #include "lib/dnssec/ta.h"
@@ -70,6 +71,10 @@ struct zone_import_ctx {
 	knot_mm_t pool;
 	zi_callback cb;
 	void *cb_param;
+
+	uint8_t *digest_buf;
+	#define DIGEST_BUF_SIZE (64*1024 - 1)
+	dnssec_digest_ctx_t *digest_ctx;
 };
 
 typedef struct zone_import_ctx zone_import_ctx_t;
@@ -96,6 +101,56 @@ static int key_get(char buf[KEY_LEN], const knot_dname_t *name,
 			&type_maysig, sizeof(type_maysig));
 	return *lf_len_p + 1 + sizeof(type) * (1 + (type == KNOT_RRTYPE_RRSIG));
 }
+
+static int digest_rrset(trie_val_t *rr_p, void *z_import_v)
+{
+	zone_import_ctx_t *z_import = z_import_v;
+	const knot_rrset_t *rr = *rr_p;
+
+	// ignore apex ZONEMD or its RRSIG
+	const bool is_apex = knot_dname_is_equal(z_import->origin, rr->owner);
+	if (is_apex && kr_rrset_type_maysig(rr) == KNOT_RRTYPE_ZONEMD)
+		return KNOT_EOK;
+
+	int ret = knot_rrset_to_wire_extra(rr, z_import->digest_buf, DIGEST_BUF_SIZE,
+					   0, NULL, KNOT_PF_ORIGTTL);
+	if (ret < 0)
+		return ret;
+
+	// digest serialized RRSet
+	dnssec_binary_t bufbin = { ret, z_import->digest_buf };
+	return dnssec_digest(z_import->digest_ctx, &bufbin);
+}
+
+static int zonemd_verify(zone_import_ctx_t *z_import)
+{
+	const int algorithm = KNOT_ZONEMD_ALORITHM_SHA384; // FIXME
+	if (!z_import->digest_buf) {
+		z_import->digest_buf = mm_alloc(&z_import->pool, DIGEST_BUF_SIZE);
+		if (!z_import->digest_buf)
+			return kr_error(ENOMEM);
+	}
+	int ret = dnssec_digest_init(algorithm, &z_import->digest_ctx);
+	if (ret != DNSSEC_EOK)
+		return kr_error(ret);
+	int trie_ret = trie_apply(z_import->rrsets, digest_rrset, z_import);
+	dnssec_binary_t digest = { 0 };
+	ret = dnssec_digest_finish(z_import->digest_ctx, &digest); // we need this to free _ctx
+	if (trie_ret)
+		return kr_error(trie_ret);
+	if (ret != DNSSEC_EOK)
+		return kr_error(ret);
+
+	// FIXME: temporary
+	printf("\n");
+	for (ssize_t i = 0; i < digest.size; ++i)
+		printf("%02x", digest.data[i]);
+	printf("\n");
+
+	free(digest.data);
+	return kr_ok();
+}
+
 
 /** @internal Allocate zone import context.
  * @return pointer to zone import context or NULL. */
@@ -816,6 +871,9 @@ int zi_zone_import(struct zone_import_ctx *z_import,
 		z_import->started = false;
 		return ret;
 	}
+
+	ret = zonemd_verify(z_import);
+	if (ret) return ret;
 
 	VERBOSE_MSG(NULL, "[zscanner] finished in %"PRIu64" ms; zone file `%s`\n",
 			    elapsed, zone_file);
