@@ -46,6 +46,7 @@
 #include "daemon/zimport.h"
 #include "lib/generic/map.h"
 #include "lib/generic/array.h"
+#include "lib/generic/trie.h"
 
 #define VERBOSE_MSG(qry, ...) QRVERBOSE(qry, ZIMPORT, __VA_ARGS__)
 
@@ -64,7 +65,7 @@ struct zone_import_ctx {
 	uint64_t start_timestamp;
 	size_t rrset_idx;
 	uv_timer_t timer;
-	map_t rrset_indexed;
+	trie_t *rrsets; /// map: key_get() -> knot_rrset_t*
 	qr_rrsetlist_t rrset_sorted;
 	knot_mm_t pool;
 	zi_callback cb;
@@ -74,6 +75,27 @@ struct zone_import_ctx {
 typedef struct zone_import_ctx zone_import_ctx_t;
 
 static int RRSET_IS_ALREADY_IMPORTED = 1;
+
+
+#define KEY_LEN (KNOT_DNAME_MAXLEN + 1 + 2 + 2)
+/** Construct key for name, type and signed type (if type == RRSIG).  ZONEMD order! */
+static int key_get(char buf[KEY_LEN], const knot_dname_t *name,
+		uint16_t type, uint16_t type_maysig, char **key_p)
+{
+	char *lf_len_p = (char *)knot_dname_lf(name, (uint8_t *)buf);
+	if (kr_fails_assert(lf_len_p && key_p))
+		return kr_error(EINVAL);
+	*key_p = lf_len_p + 1;
+	// LF is output as right-aligned on KNOT_DNAME_MAXLEN index.
+	if (kr_fails_assert(*key_p + *lf_len_p - KNOT_DNAME_MAXLEN == buf))
+		return kr_error(EINVAL);
+	buf[KNOT_DNAME_MAXLEN] = 0;
+	memcpy(buf + KNOT_DNAME_MAXLEN + 1, &type, sizeof(type));
+	if (type == KNOT_RRTYPE_RRSIG)
+		memcpy(buf + KNOT_DNAME_MAXLEN + 1 + sizeof(type),
+			&type_maysig, sizeof(type_maysig));
+	return *lf_len_p + 1 + sizeof(type) * (1 + (type == KNOT_RRTYPE_RRSIG));
+}
 
 /** @internal Allocate zone import context.
  * @return pointer to zone import context or NULL. */
@@ -102,7 +124,7 @@ static int zi_reset(struct zone_import_ctx *z_import, size_t rrset_sorted_list_s
 	z_import->start_timestamp = 0;
 	z_import->rrset_idx = 0;
 	z_import->pool.alloc = (knot_mm_alloc_t) mp_alloc;
-	z_import->rrset_indexed = map_make(&z_import->pool);
+	z_import->rrsets = trie_create(&z_import->pool);
 
 	array_init(z_import->rrset_sorted);
 
@@ -192,23 +214,23 @@ static inline bool zi_rrset_is_marked_as_imported(knot_rrset_t *rr)
  *          1 if required record could not be found */
 static int zi_rrset_find_put(struct zone_import_ctx *z_import,
 			     knot_pkt_t *pkt, const knot_dname_t *owner,
-			     uint16_t class, uint16_t type, uint16_t additional)
+			     uint16_t class, uint16_t type, uint16_t type_maysig)
 {
 	if (type != KNOT_RRTYPE_RRSIG) {
 		/* If required rrset isn't rrsig, these must be the same values */
-		additional = type;
+		type_maysig = type;
 	}
 
-	char key[KR_RRKEY_LEN];
-	int err = kr_rrkey(key, class, owner, type, additional);
-	if (err <= 0) {
+	char key_buf[KEY_LEN], *key;
+	const int len = key_get(key_buf, owner, type, type_maysig, &key);
+	if (len < 0)
 		return -1;
-	}
-	knot_rrset_t *rr = map_get(&z_import->rrset_indexed, key);
-	if (!rr) {
+	const trie_val_t *rr_p = trie_get_try(z_import->rrsets, key, len);
+	if (!rr_p)
 		return 1;
-	}
-	err = knot_pkt_put(pkt, 0, rr, 0);
+	knot_rrset_t * const rr = *rr_p;
+
+	int err = knot_pkt_put(pkt, 0, rr, 0);
 	if (err != KNOT_EOK) {
 		return -1;
 	}
@@ -436,13 +458,11 @@ cleanup:
 
 /** @internal Create element in qr_rrsetlist_t rrset_list for
  * given node of map_t rrset_sorted.  */
-static int zi_mapwalk_preprocess(const char *k, void *v, void *baton)
+static int zi_rrsets_preprocess(trie_val_t *rr_p, void *z_import_v)
 {
-	zone_import_ctx_t *z_import = (zone_import_ctx_t *)baton;
-
-	int ret = array_push_mm(z_import->rrset_sorted, v, kr_memreserve, &z_import->pool);
-
-	return (ret < 0);
+	zone_import_ctx_t *z_import = z_import_v;
+	int ret = array_push_mm(z_import->rrset_sorted, *rr_p, kr_memreserve, &z_import->pool);
+	return ret < 0 ? ret : kr_ok();
 }
 
 /** @internal Iterate over parsed rrsets and try to import each of them. */
@@ -479,22 +499,20 @@ static void zi_zone_process(uv_timer_t* handle)
 	/* TA have been found, zone is secured.
 	 * DNSKEY must be somewhere amongst the imported records. Find it.
 	 * TODO - For those zones that provenly do not have TA this step must be skipped. */
-	char key[KR_RRKEY_LEN];
-	int err = kr_rrkey(key, KNOT_CLASS_IN, z_import->origin,
-			   KNOT_RRTYPE_DNSKEY, KNOT_RRTYPE_DNSKEY);
-	if (err <= 0) {
+	char key_buf[KEY_LEN], *key;
+	const int len = key_get(key_buf, z_import->origin, KNOT_RRTYPE_DNSKEY, 0, &key);
+	if (len < 0) {
 		failed = 1;
 		goto finish;
 	}
-
-	knot_rrset_t *rr_key = map_get(&z_import->rrset_indexed, key);
-	if (!rr_key) {
+	const trie_val_t *rr_p = trie_get_try(z_import->rrsets, key, len);
+	if (!rr_p) {
 		/* DNSKEY MUST be here. If not found - fail. */
 		kr_log_error(ZIMPORT, "DNSKEY not found for `%s`, fail\n", zone_name_str);
 		failed = 1;
 		goto finish;
 	}
-	z_import->key = rr_key;
+	knot_rrset_t * const rr_key = z_import->key = *rr_p;
 
 	map_t *trust_anchors = &z_import->worker->engine->resolver.trust_anchors;
 	knot_rrset_t *rr_ta = kr_ta_get(trust_anchors, z_import->origin);
@@ -647,23 +665,22 @@ static int zi_record_store(zs_scanner_t *s)
 	/* Records in zone file may not be grouped by name and RR type.
 	 * Use map to create search key and
 	 * avoid ineffective searches across all the imported records. */
-	char key[KR_RRKEY_LEN];
-	uint16_t additional_key_field = kr_rrset_type_maysig(new_rr);
-
-	res = kr_rrkey(key, new_rr->rclass, new_rr->owner, new_rr->type,
-		       additional_key_field);
-	if (res <= 0) {
+	char key_buf[KEY_LEN], *key;
+	const int len = key_get(key_buf, new_rr->owner, new_rr->type,
+				kr_rrset_type_maysig(new_rr), &key);
+	if (len < 0) {
 		kr_log_error(ZSCANNER, "line %"PRIu64": error constructing rrkey\n",
 				s->line_counter);
 		return -1;
 	}
-
-	knot_rrset_t *saved_rr = map_get(&z_import->rrset_indexed, key);
-	if (saved_rr) {
-		res = knot_rdataset_merge(&saved_rr->rrs, &new_rr->rrs,
-					  &z_import->pool);
+	trie_val_t *rr_p = trie_get_ins(z_import->rrsets, key, len);
+	if (!rr_p)
+		return -1; // ENOMEM
+	if (*rr_p) {
+		knot_rrset_t *rr = *rr_p;
+		res = knot_rdataset_merge(&rr->rrs, &new_rr->rrs, &z_import->pool);
 	} else {
-		res = map_set(&z_import->rrset_indexed, key, new_rr);
+		*rr_p = new_rr;
 	}
 	if (res != 0) {
 		kr_log_error(ZSCANNER, "line %"PRIu64": error saving parsed rrset\n",
@@ -686,7 +703,7 @@ static int zi_state_parsing(zs_scanner_t *s)
 			}
 			zone_import_ctx_t *z_import = (zone_import_ctx_t *) s->process.data;
 			empty = false;
-			if (s->r_type == 6) {
+			if (s->r_type == KNOT_RRTYPE_SOA) {
 				z_import->origin = knot_dname_copy(s->r_owner,
                                                                  &z_import->pool);
 			}
@@ -802,7 +819,7 @@ int zi_zone_import(struct zone_import_ctx *z_import,
 
 	VERBOSE_MSG(NULL, "[zscanner] finished in %"PRIu64" ms; zone file `%s`\n",
 			    elapsed, zone_file);
-	map_walk(&z_import->rrset_indexed, zi_mapwalk_preprocess, z_import);
+	trie_apply(z_import->rrsets, zi_rrsets_preprocess, z_import);
 
 	/* Zone have been parsed already, so start the import. */
 	uv_timer_start(&z_import->timer, zi_zone_process,
