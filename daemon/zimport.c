@@ -40,6 +40,7 @@
 #include <libknot/rrset.h>
 #include <libzscanner/scanner.h>
 
+#include <libknot/version.h>
 #define ENABLE_ZONEMD (KNOT_VERSION_HEX >= 0x030100)
 #if ENABLE_ZONEMD
 	#include <libdnssec/digest.h>
