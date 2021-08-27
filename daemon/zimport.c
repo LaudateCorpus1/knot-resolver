@@ -39,7 +39,11 @@
 #include <ucw/mempool.h>
 #include <libknot/rrset.h>
 #include <libzscanner/scanner.h>
-#include <libdnssec/digest.h>
+
+#define ENABLE_ZONEMD (KNOT_VERSION_HEX >= 0x030100)
+#if ENABLE_ZONEMD
+	#include <libdnssec/digest.h>
+#endif
 
 #include "lib/utils.h"
 #include "lib/dnssec/ta.h"
@@ -71,7 +75,7 @@ struct zone_import_ctx {
 	knot_mm_t pool;
 	zi_callback cb;
 	void *cb_param;
-
+#if ENABLE_ZONEMD
 	uint8_t *digest_buf; /// temporary buffer for digest computation (on pool)
 	#define DIGEST_BUF_SIZE (64*1024 - 1)
 	#define DIGEST_ALG_COUNT 2
@@ -80,6 +84,7 @@ struct zone_import_ctx {
 		dnssec_digest_ctx_t *ctx;
 		const uint8_t *expected; /// expected digest (inside zonemd on pool)
 	} digests[DIGEST_ALG_COUNT]; /// we use indices 0 and 1 for SHA 384 and 512
+#endif
 };
 
 typedef struct zone_import_ctx zone_import_ctx_t;
@@ -107,6 +112,7 @@ static int key_get(char buf[KEY_LEN], const knot_dname_t *name,
 	return *lf_len_p + 1 + sizeof(type) * (1 + (type == KNOT_RRTYPE_RRSIG));
 }
 
+#if ENABLE_ZONEMD
 static int digest_rrset(trie_val_t *rr_p, void *z_import_v)
 {
 	zone_import_ctx_t *z_import = z_import_v;
@@ -273,6 +279,7 @@ do_digest:
 		free(digests[i].data);
 	return has_match ? kr_ok() : kr_error(ENOENT);
 }
+#endif
 
 
 /** @internal Allocate zone import context.
@@ -304,7 +311,9 @@ static int zi_reset(struct zone_import_ctx *z_import, size_t rrset_sorted_list_s
 	z_import->pool.alloc = (knot_mm_alloc_t) mp_alloc;
 	z_import->rrsets = trie_create(&z_import->pool);
 
+#if ENABLE_ZONEMD
 	memset(z_import->digests, 0, sizeof(z_import->digests));
+#endif
 
 	array_init(z_import->rrset_sorted);
 
@@ -997,9 +1006,11 @@ int zi_zone_import(struct zone_import_ctx *z_import,
 		return ret;
 	}
 
+#if ENABLE_ZONEMD
 	// FIXME: DNSSEC verify the ZONEMD RR set before this.
 	ret = zonemd_verify(z_import);
-	if (ret) return ret;
+	//if (ret) return ret;
+#endif
 
 	VERBOSE_MSG(NULL, "[zscanner] finished in %"PRIu64" ms; zone file `%s`\n",
 			    elapsed, zone_file);
