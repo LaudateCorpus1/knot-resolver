@@ -143,6 +143,24 @@ int kr_rrset_validate(kr_rrset_validation_ctx_t *vctx, knot_rrset_t *covered)
 	return kr_error(ENOENT);
 }
 
+/** Assuming `rrs` was validated with `sig`, trim its TTL in case it's over-extended. */
+static bool trim_ttl(knot_rrset_t *rrs, const knot_rdata_t *sig,
+			uint32_t timestamp, const struct kr_query *log_qry)
+{
+	const uint32_t ttl_max = MIN(knot_rrsig_original_ttl(sig),
+			knot_rrsig_sig_expiration(sig) - timestamp);
+	if (likely(rrs->ttl <= ttl_max))
+		return false;
+	if (kr_log_is_debug_qry(VALIDATOR, log_qry)) {
+		auto_free char *name_str = kr_dname_text(rrs->owner),
+				*type_str = kr_rrtype_text(rrs->type);
+		QRVERBOSE(log_qry, VALIDATOR, "trimming TTL of %s %s: %d -> %d\n",
+			name_str, type_str, (int)rrs->ttl, (int)ttl_max);
+	}
+	rrs->ttl = ttl_max;
+	return true;
+}
+
 /**
  * Validate RRSet using a specific key.
  * @param vctx    Pointer to validation context.
@@ -160,7 +178,6 @@ static int kr_rrset_validate_with_key(kr_rrset_validation_ctx_t *vctx,
 	const knot_pkt_t *pkt         = vctx->pkt;
 	const knot_rrset_t *keys      = vctx->keys;
 	const knot_dname_t *zone_name = vctx->zone_name;
-	uint32_t timestamp            = vctx->timestamp;
 	bool has_nsec3		      = vctx->has_nsec3;
 	struct dnssec_key *created_key = NULL;
 
@@ -182,12 +199,10 @@ static int kr_rrset_validate_with_key(kr_rrset_validation_ctx_t *vctx,
 		}
 		key = created_key;
 	}
-	uint16_t keytag = dnssec_key_get_keytag((dnssec_key_t *)key);
-	int covered_labels = knot_dname_labels(covered->owner, NULL);
-	if (knot_dname_is_wildcard(covered->owner)) {
-		/* The asterisk does not count, RFC4034 3.1.3, paragraph 3. */
-		--covered_labels;
-	}
+	uint16_t keytag = dnssec_key_get_keytag(key);
+	/* The asterisk does not count, RFC4034 3.1.3, paragraph 3. */
+	const int covered_labels = knot_dname_labels(covered->owner, NULL)
+				- knot_dname_is_wildcard(covered->owner);
 
 	for (uint16_t i = 0; i < vctx->rrs->len; ++i) {
 		/* Consider every RRSIG that matches and comes from the same query. */
@@ -244,22 +259,8 @@ static int kr_rrset_validate_with_key(kr_rrset_validation_ctx_t *vctx,
 				}
 				vctx->flags |= KR_DNSSEC_VFLG_WEXPAND;
 			}
-			/* Validated with current key, OK;
-			 * now just trim TTL in case it's over-extended. */
-			const uint32_t ttl_max = MIN(knot_rrsig_original_ttl(rdata_j),
-					knot_rrsig_sig_expiration(rdata_j) - timestamp);
-			if (unlikely(covered->ttl > ttl_max)) {
-				if (kr_log_is_debug_qry(VALIDATOR, vctx->log_qry)) {
-					auto_free char
-						*name_str = kr_dname_text(covered->owner),
-						*type_str = kr_rrtype_text(covered->type);
-					QRVERBOSE(vctx->log_qry, VALIDATOR,
-						"trimming TTL of %s %s: %d -> %d\n",
-						name_str, type_str,
-						(int)covered->ttl, (int)ttl_max);
-				}
-				covered->ttl = ttl_max;
-			}
+
+			trim_ttl(covered, rdata_j, vctx->timestamp, vctx->log_qry);
 
 			kr_dnssec_key_free(&created_key);
 			vctx->result = kr_ok();
