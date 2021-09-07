@@ -292,10 +292,9 @@ bool kr_ds_algo_support(const knot_rrset_t *ta)
 
 int kr_dnskeys_trusted(kr_rrset_validation_ctx_t *vctx, const knot_rrset_t *ta)
 {
-	const knot_pkt_t *pkt         = vctx->pkt;
 	knot_rrset_t *keys            = vctx->keys;
 
-	const bool ok = pkt && keys && ta && ta->rrs.count && ta->rrs.rdata
+	const bool ok = keys && ta && ta->rrs.count && ta->rrs.rdata
 			&& ta->type == KNOT_RRTYPE_DS;
 	if (kr_fails_assert(ok))
 		return kr_error(EINVAL);
