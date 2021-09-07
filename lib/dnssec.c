@@ -314,7 +314,7 @@ int kr_dnskeys_trusted(kr_rrset_validation_ctx_t *vctx, const knot_rrset_t *ta)
 		struct dnssec_key *key = NULL;
 		if (kr_dnssec_key_from_rdata(&key, keys->owner, krr->data, krr->len) != 0)
 			continue;
-		if (kr_authenticate_referral(ta, (dnssec_key_t *) key) != 0) {
+		if (kr_authenticate_referral(ta, key) != 0) {
 			kr_dnssec_key_free(&key);
 			continue;
 		}
