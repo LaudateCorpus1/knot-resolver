@@ -49,18 +49,18 @@ void kr_crypto_reinit(void)
  * @param flags     The flags are going to be set according to validation result.
  * @param cov_labels Covered RRSet owner label count.
  * @param rrsigs    rdata containing the signatures.
- * @param key_rdata Associated DNSKEY's rdata.
+ * @param key_alg   DNSKEY's algorithm.
  * @param keytag    Used key tag.
  * @param vctx->zone_name The name of the zone cut (and the DNSKEY).
  * @param vctx->timestamp Validation time.
  */
 static int validate_rrsig_rr(int *flags, int cov_labels,
                              const knot_rdata_t *rrsigs,
-                             const knot_rdata_t *key_rdata,
+                             uint8_t key_alg,
 			     uint16_t keytag,
                              kr_rrset_validation_ctx_t *vctx)
 {
-	if (kr_fails_assert(flags && rrsigs && key_rdata && vctx && vctx->zone_name)) {
+	if (kr_fails_assert(flags && rrsigs && vctx && vctx->zone_name)) {
 		return kr_error(EINVAL);
 	}
 	/* bullet 5 */
@@ -93,7 +93,7 @@ static int validate_rrsig_rr(int *flags, int cov_labels,
 
 	/* bullet 7 */
 	if ((!knot_dname_is_equal(vctx->zone_name, signer_name)) ||
-	    (knot_dnskey_alg(key_rdata) != knot_rrsig_alg(rrsigs)) ||
+	    (key_alg != knot_rrsig_alg(rrsigs)) ||
 	    (keytag != knot_rrsig_key_tag(rrsigs))) {
 		vctx->rrs_counters.key_invalid++;
 		return kr_error(EINVAL);
@@ -200,6 +200,7 @@ static int kr_rrset_validate_with_key(kr_rrset_validation_ctx_t *vctx,
 		key = created_key;
 	}
 	uint16_t keytag = dnssec_key_get_keytag(key);
+	const uint8_t key_alg = knot_dnskey_alg(key_rdata);
 	/* The asterisk does not count, RFC4034 3.1.3, paragraph 3. */
 	const int covered_labels = knot_dname_labels(covered->owner, NULL)
 				- knot_dname_is_wildcard(covered->owner);
@@ -224,7 +225,7 @@ static int kr_rrset_validate_with_key(kr_rrset_validation_ctx_t *vctx,
 			kr_rank_set(&vctx->rrs->at[i]->rank, KR_RANK_BOGUS); /* defensive style */
 			vctx->rrs_counters.matching_name_type++;
 			int retv = validate_rrsig_rr(&val_flgs, covered_labels, rdata_j,
-							key_rdata, keytag, vctx);
+							key_alg, keytag, vctx);
 			if (retv == kr_error(EAGAIN)) {
 				kr_dnssec_key_free(&created_key);
 				vctx->result = retv;
