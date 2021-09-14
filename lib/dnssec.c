@@ -172,6 +172,7 @@ static int svldr_key_new(const knot_rdata_t *rdata, const knot_dname_t *owner,
 			 kr_svldr_key_t *result)
 {
 	result->alg = knot_dnskey_alg(rdata);
+	result->key = NULL; // just silence analyzers
 	int ret = kr_dnssec_key_from_rdata(&result->key, owner, rdata->data, rdata->len);
 	if (likely(ret == 0))
 		result->tag = dnssec_key_get_keytag(result->key);
