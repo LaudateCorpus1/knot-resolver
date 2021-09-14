@@ -161,6 +161,57 @@ static bool trim_ttl(knot_rrset_t *rrs, const knot_rdata_t *sig,
 	return true;
 }
 
+
+typedef struct {
+	struct dnssec_key *key;
+	uint8_t alg;
+	uint16_t tag;
+} kr_svldr_key_t;
+
+static int svldr_key_new(const knot_rdata_t *rdata, const knot_dname_t *owner,
+			 kr_svldr_key_t *result)
+{
+	result->alg = knot_dnskey_alg(rdata);
+	int ret = kr_dnssec_key_from_rdata(&result->key, owner, rdata->data, rdata->len);
+	if (likely(ret == 0))
+		result->tag = dnssec_key_get_keytag(result->key);
+	return ret;
+}
+static inline void svldr_key_del(kr_svldr_key_t *skey)
+{
+	kr_dnssec_key_free(&skey->key);
+}
+
+static int kr_svldr_rrset_with_key(knot_rrset_t *rrs, const knot_rdataset_t *rrsigs,
+				kr_rrset_validation_ctx_t *vctx, const kr_svldr_key_t *key)
+{
+	const int covered_labels = knot_dname_labels(rrs->owner, NULL)
+				- knot_dname_is_wildcard(rrs->owner);
+	knot_rdata_t *rdata_j = rrsigs->rdata;
+	for (uint16_t j = 0; j < rrsigs->count; ++j, rdata_j = knot_rdataset_next(rdata_j)) {
+		int val_flgs = 0;
+		int retv = validate_rrsig_rr(&val_flgs, covered_labels, rdata_j,
+						key->alg, key->tag, vctx);
+		if (retv == kr_error(EAGAIN)) {
+			return vctx->result = retv;
+		} else if (retv != 0) {
+			continue;
+		}
+		// We only expect non-expanded wildcard records in input;
+		// that also means we don't need to perform non-existence proofs.
+		const int trim_labels = (val_flgs & FLG_WILDCARD_EXPANSION) ? 1 : 0;
+		if (kr_check_signature(rdata_j, key->key, rrs, trim_labels) == 0) {
+			trim_ttl(rrs, rdata_j, vctx->timestamp, vctx->log_qry);
+			return vctx->result = kr_ok();
+		} else {
+			vctx->rrs_counters.crypto_invalid++;
+		}
+	}
+	return vctx->result = kr_error(ENOENT);
+}
+/* The implementation basically performs "parts of" kr_rrset_validate(). */
+
+
 /**
  * Validate RRSet using a specific key.
  * @param vctx    Pointer to validation context.
