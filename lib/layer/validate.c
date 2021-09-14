@@ -338,6 +338,19 @@ static int validate_keyset(struct kr_request *req, knot_pkt_t *answer, bool has_
 		}
 	}
 
+	/* Find signatures for the DNSKEY */
+	knot_rdataset_t sigs;
+	knot_rdataset_init(&sigs);
+	for (int i = 0; i < an->count; ++i) {
+		const knot_rrset_t *rr = knot_pkt_rr(an, i);
+		bool ok = rr->type == KNOT_RRTYPE_RRSIG
+			&& knot_rrsig_type_covered(rr->rrs.rdata) == KNOT_RRTYPE_DNSKEY
+			&& knot_dname_is_equal(rr->owner, qry->zone_cut.key->owner);
+		if (!ok) continue;
+		int ret = knot_rdataset_merge(&sigs, &rr->rrs, qry->zone_cut.pool);
+		if (ret) return kr_error(ret);
+	}
+
 	/* Check if there's a key for current TA. */
 	if (updated_key && !(qry->flags.CACHED)) {
 
@@ -354,7 +367,7 @@ static int validate_keyset(struct kr_request *req, knot_pkt_t *answer, bool has_
 			.result		= 0,
 			.log_qry	= qry,
 		};
-		int ret = kr_dnskeys_trusted(&vctx, qry->zone_cut.trust_anchor);
+		int ret = kr_dnskeys_trusted(&vctx, &sigs, qry->zone_cut.trust_anchor);
 		if (ret != 0) {
 			if (ret != kr_error(DNSSEC_INVALID_DS_ALGORITHM) &&
 			    ret != kr_error(EAGAIN)) {
