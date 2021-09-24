@@ -197,7 +197,7 @@ void kr_svldr_free_ctx(struct kr_svldr_ctx *ctx)
 	free_const(ctx->vctx.zone_name);
 	free(ctx);
 }
-struct kr_svldr_ctx * kr_svldr_new_ctx(knot_rrset_t *ds, knot_rrset_t *dnskey,
+struct kr_svldr_ctx * kr_svldr_new_ctx(const knot_rrset_t *ds, knot_rrset_t *dnskey,
 		const knot_rdataset_t *dnskey_sigs, uint32_t timestamp)
 {
 	// Basic init.

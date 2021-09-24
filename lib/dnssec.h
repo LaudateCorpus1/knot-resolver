@@ -161,7 +161,7 @@ struct kr_svldr_ctx;
  * - The insides are placed on malloc heap (use _free_ctx).
  */
 KR_EXPORT
-struct kr_svldr_ctx * kr_svldr_new_ctx(knot_rrset_t *ds, knot_rrset_t *dnskey,
+struct kr_svldr_ctx * kr_svldr_new_ctx(const knot_rrset_t *ds, knot_rrset_t *dnskey,
 		const knot_rdataset_t *dnskey_sigs, uint32_t timestamp);
 /** Free the context.  Passing NULL is OK. */
 KR_EXPORT
