@@ -5,6 +5,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 struct worker_ctx;
 /** Zone import context (opaque).  */

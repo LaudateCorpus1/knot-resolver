@@ -32,6 +32,8 @@
  * been received from network.
  */
 
+#include "daemon/zimport.h"
+
 #include <inttypes.h> /* PRIu64 */
 #include <limits.h>
 #include <stdlib.h>
@@ -46,19 +48,17 @@
 	#include <libdnssec/digest.h>
 #endif
 
-#include "lib/utils.h"
-#include "lib/dnssec/ta.h"
 #include "daemon/worker.h"
-#include "daemon/zimport.h"
+#include "lib/dnssec/ta.h"
+#include "lib/dnssec.h"
 #include "lib/generic/map.h"
 #include "lib/generic/array.h"
 #include "lib/generic/trie.h"
+#include "lib/utils.h"
 
 /* Pause between parse and import stages, milliseconds.
  * See comment in zi_zone_import() */
 #define ZONE_IMPORT_PAUSE 100
-
-typedef array_t(knot_rrset_t *) qr_rrsetlist_t;
 
 struct zone_import_ctx {
 	struct worker_ctx *worker;
@@ -69,11 +69,16 @@ struct zone_import_ctx {
 	uint64_t start_timestamp;
 	size_t rrset_idx;
 	uv_timer_t timer;
-	trie_t *rrsets; /// map: key_get() -> knot_rrset_t*
-	qr_rrsetlist_t rrset_sorted;
 	knot_mm_t pool;
 	zi_callback cb;
 	void *cb_param;
+
+	trie_t *rrsets; /// map: key_get() -> knot_rrset_t*
+	uint32_t timestamp_rr; /// stamp of when RR data arrived (seconds since epoch)
+
+	struct kr_svldr_ctx *svldr;
+	const knot_dname_t *last_cut; /// internal to zi_rrset_import()
+
 #if ENABLE_ZONEMD
 	uint8_t *digest_buf; /// temporary buffer for digest computation (on pool)
 	#define DIGEST_BUF_SIZE (64*1024 - 1)
@@ -87,8 +92,6 @@ struct zone_import_ctx {
 };
 
 typedef struct zone_import_ctx zone_import_ctx_t;
-
-static int RRSET_IS_ALREADY_IMPORTED = 1;
 
 
 #define KEY_LEN (KNOT_DNAME_MAXLEN + 1 + 2 + 2)
@@ -146,11 +149,12 @@ static int digest_rrset(trie_val_t *rr_p, void *z_import_v)
  */
 static int zonemd_verify(zone_import_ctx_t *z_import)
 {
-	// Find zonemd RR
-	knot_rrset_t *rr_zonemd = NULL;
+	bool zonemd_is_valid = false;
+	// Find ZONEMD RR + RRSIG
+	knot_rrset_t *rr_zonemd = NULL, *rrsig_zonemd = NULL;
 	{
 		char key_buf[KEY_LEN], *key;
-		const int len = key_get(key_buf, z_import->origin,
+		int len = key_get(key_buf, z_import->origin,
 					KNOT_RRTYPE_ZONEMD, 0, &key);
 		if (len < 0)
 			return kr_error(len);
@@ -165,7 +169,23 @@ static int zonemd_verify(zone_import_ctx_t *z_import)
 			//z_import->digests[KNOT_ZONEMD_ALORITHM_SHA512 - 1].active = true;
 			goto do_digest;
 		}
+
+		len = key_get(key_buf, z_import->origin,
+				KNOT_RRTYPE_RRSIG, KNOT_RRTYPE_ZONEMD, &key);
+		const trie_val_t *rrsig_p = trie_get_try(z_import->rrsets, key, len);
+		if (rrsig_p)
+			rrsig_zonemd = *rrsig_p;
 	}
+	// Validate ZONEMD RRSIG
+	{
+		int ret = rrsig_zonemd
+			? kr_svldr_rrset(rr_zonemd, &rrsig_zonemd->rrs, z_import->svldr)
+			: kr_error(ENOENT);
+		zonemd_is_valid = (ret == kr_ok());
+		if (!zonemd_is_valid)
+			kr_log_error(PREFILL, "ZONEMD signature failed to validate\n");
+	}
+
 	// Get SOA serial
 	uint32_t soa_serial = -1;
 	{
@@ -276,7 +296,7 @@ do_digest:
 
 	for (int i = 0; i < DIGEST_ALG_COUNT; ++i)
 		free(digests[i].data);
-	return has_match ? kr_ok() : kr_error(ENOENT);
+	return has_match && zonemd_is_valid ? kr_ok() : kr_error(ENOENT);
 }
 #endif
 
@@ -313,16 +333,7 @@ static int zi_reset(struct zone_import_ctx *z_import, size_t rrset_sorted_list_s
 #if ENABLE_ZONEMD
 	memset(z_import->digests, 0, sizeof(z_import->digests));
 #endif
-
-	array_init(z_import->rrset_sorted);
-
-	int ret = 0;
-	if (rrset_sorted_list_size) {
-		ret = array_reserve_mm(z_import->rrset_sorted, rrset_sorted_list_size,
-				       kr_memreserve, &z_import->pool);
-	}
-
-	return ret;
+	return kr_ok();
 }
 
 /** @internal Close callback for timer handle.
@@ -379,278 +390,79 @@ void zi_free(zone_import_ctx_t *z_import)
 	uv_close((uv_handle_t *)&z_import->timer, on_timer_close);
 }
 
-/** @internal Mark rrset that has been already imported
- *  to avoid repeated import. */
-static inline void zi_rrset_mark_as_imported(knot_rrset_t *rr)
-{
-	rr->additional = (void *)&RRSET_IS_ALREADY_IMPORTED;
-}
-
-/** @internal Check if rrset is marked as "already imported".
- * @return true if marked, false if isn't */
-static inline bool zi_rrset_is_marked_as_imported(knot_rrset_t *rr)
-{
-	return (rr->additional == &RRSET_IS_ALREADY_IMPORTED);
-}
-
-/** @internal Try to find rrset with given requisites amongst parsed rrsets
- * and put it to given packet. If there is RRSIG which covers that rrset, it
- * will be added as well. If rrset found and successfully put, it marked as
- * "already imported" to avoid repeated import. The same is true for RRSIG.
- * @return -1 if failed
- *          0 if required record been actually put into the packet
- *          1 if required record could not be found */
-static int zi_rrset_find_put(struct zone_import_ctx *z_import,
-			     knot_pkt_t *pkt, const knot_dname_t *owner,
-			     uint16_t class, uint16_t type, uint16_t type_maysig)
-{
-	if (type != KNOT_RRTYPE_RRSIG) {
-		/* If required rrset isn't rrsig, these must be the same values */
-		type_maysig = type;
-	}
-
-	char key_buf[KEY_LEN], *key;
-	const int len = key_get(key_buf, owner, type, type_maysig, &key);
-	if (len < 0)
-		return -1;
-	const trie_val_t *rr_p = trie_get_try(z_import->rrsets, key, len);
-	if (!rr_p)
-		return 1;
-	knot_rrset_t * const rr = *rr_p;
-
-	int err = knot_pkt_put(pkt, 0, rr, 0);
-	if (err != KNOT_EOK) {
-		return -1;
-	}
-	zi_rrset_mark_as_imported(rr);
-
-	if (type != KNOT_RRTYPE_RRSIG) {
-		/* Try to find corresponding rrsig */
-		err = zi_rrset_find_put(z_import, pkt, owner,
-					class, KNOT_RRTYPE_RRSIG, type);
-		if (err < 0) {
-			return err;
-		}
-	}
-
-	return 0;
-}
-
-/** @internal Try to put given rrset to the given packet.
- * If there is RRSIG which covers that rrset, it will be added as well.
- * If rrset successfully put in the packet, it marked as
- * "already imported" to avoid repeated import.
- * The same is true for RRSIG.
- * @return -1 if failed
- *          0 if required record been actually put into the packet */
-static int zi_rrset_put(struct zone_import_ctx *z_import, knot_pkt_t *pkt,
-			knot_rrset_t *rr)
-{
-	if (kr_fails_assert(rr && rr->type != KNOT_RRTYPE_RRSIG))
-		return -1;
-	int err = knot_pkt_put(pkt, 0, rr, 0);
-	if (err != KNOT_EOK) {
-		return -1;
-	}
-	zi_rrset_mark_as_imported(rr);
-	/* Try to find corresponding RRSIG */
-	err = zi_rrset_find_put(z_import, pkt, rr->owner, rr->rclass,
-				KNOT_RRTYPE_RRSIG, rr->type);
-	return (err < 0) ? err : 0;
-}
-
-/** @internal Try to put DS & NSEC* for rset->owner to given packet.
- * @return -1 if failed;
- *          0 if no errors occurred (it doesn't mean
- *            that records were actually added). */
-static int zi_put_delegation(zone_import_ctx_t *z_import, knot_pkt_t *pkt,
-			     knot_rrset_t *rr)
-{
-	int err = zi_rrset_find_put(z_import, pkt, rr->owner,
-				    rr->rclass, KNOT_RRTYPE_DS, 0);
-	if (err == 1) {
-		/* DS not found, maybe there are NSEC* */
-		err = zi_rrset_find_put(z_import, pkt, rr->owner,
-					rr->rclass, KNOT_RRTYPE_NSEC, 0);
-		if (err >= 0) {
-			err = zi_rrset_find_put(z_import, pkt, rr->owner,
-						rr->rclass, KNOT_RRTYPE_NSEC3, 0);
-		}
-	}
-	return err < 0 ? err : 0;
-}
-
-/** @internal Try to put A & AAAA records for rset->owner to given packet.
- * @return -1 if failed;
- *          0 if no errors occurred (it doesn't mean
- *            that records were actually added). */
-static int zi_put_glue(zone_import_ctx_t *z_import, knot_pkt_t *pkt,
-			     knot_rrset_t *rr)
-{
-	int err = 0;
-	knot_rdata_t *rdata_i = rr->rrs.rdata;
-	for (uint16_t i = 0; i < rr->rrs.count;
-			++i, rdata_i = knot_rdataset_next(rdata_i)) {
-		const knot_dname_t *ns_name = knot_ns_name(rdata_i);
-		err = zi_rrset_find_put(z_import, pkt, ns_name,
-					rr->rclass, KNOT_RRTYPE_A, 0);
-		if (err < 0) {
-			break;
-		}
-
-		err = zi_rrset_find_put(z_import, pkt, ns_name,
-					rr->rclass, KNOT_RRTYPE_AAAA, 0);
-		if (err < 0) {
-			break;
-		}
-	}
-	return err < 0 ? err : 0;
-}
-
-/** @internal Create query. */
-static knot_pkt_t *zi_query_create(zone_import_ctx_t *z_import, knot_rrset_t *rr)
-{
-	knot_mm_t *pool = &z_import->pool;
-
-	uint32_t msgid = kr_rand_bytes(2);
-
-	knot_pkt_t *query = knot_pkt_new(NULL, KNOT_WIRE_MAX_PKTSIZE, pool);
-	if (!query) {
-		return NULL;
-	}
-
-	knot_pkt_put_question(query, rr->owner, rr->rclass, rr->type);
-	knot_pkt_begin(query, KNOT_ANSWER);
-	knot_wire_set_rd(query->wire);
-	knot_wire_set_id(query->wire, msgid);
-	int err = knot_pkt_parse(query, 0);
-	if (err != KNOT_EOK) {
-		knot_pkt_free(query);
-		return NULL;
-	}
-
-	return query;
-}
-
-/** @internal Import given rrset to cache.
- * @return -1 if failed; 0 if success */
-static int zi_rrset_import(zone_import_ctx_t *z_import, knot_rrset_t *rr)
-{
-	/* Create "pseudo query" which asks for given rrset. */
-	knot_pkt_t *query = zi_query_create(z_import, rr);
-	if (!query) {
-		return -1;
-	}
-
-	knot_mm_t *pool = &z_import->pool;
-	uint8_t *dname = rr->owner;
-	uint16_t rrtype = rr->type;
-	uint16_t rrclass = rr->rclass;
-
-	/* Create "pseudo answer". */
-	knot_pkt_t *answer = knot_pkt_new(NULL, KNOT_WIRE_MAX_PKTSIZE, pool);
-	if (!answer) {
-		knot_pkt_free(query);
-		return -1;
-	}
-	knot_pkt_put_question(answer, dname, rrclass, rrtype);
-	knot_pkt_begin(answer, KNOT_ANSWER);
-
-	struct kr_qflags options = { 0 };
-	options.DNSSEC_WANT = true;
-	options.NO_MINIMIZE = true;
-
-	/* This call creates internal structures which necessary for
-	 * resolving - qr_task & request_ctx. */
-	struct qr_task *task = worker_resolve_start(query, options);
-	if (!task) {
-		knot_pkt_free(query);
-		knot_pkt_free(answer);
-		return -1;
-	}
-
-	/* Push query to the request resolve plan.
-	 * Actually query will never been sent to upstream. */
-	struct kr_request *request = worker_task_request(task);
-	struct kr_rplan *rplan = &request->rplan;
-	struct kr_query *qry = kr_rplan_push(rplan, NULL, dname, rrclass, rrtype);
-	int state = KR_STATE_FAIL;
-	bool origin_is_owner = knot_dname_is_equal(rr->owner, z_import->origin);
-	bool is_referral = (rrtype == KNOT_RRTYPE_NS && !origin_is_owner);
-	uint32_t msgid = knot_wire_get_id(query->wire);
-
-	qry->id = msgid;
-
-	/* Prepare zonecut. It must have all the necessary requisites for
-	 * successful validation - matched zone name & keys & trust-anchors. */
-	kr_zonecut_init(&qry->zone_cut, z_import->origin, pool);
-	qry->zone_cut.key = z_import->key;
-	qry->zone_cut.trust_anchor = z_import->ta;
-
-	if (knot_pkt_init_response(answer, query) != 0) {
-		goto cleanup;
-	}
-
-	/* Since "pseudo" query asks for NS for subzone,
-	 * "pseudo" answer must simulate referral. */
-	if (is_referral) {
-		knot_pkt_begin(answer, KNOT_AUTHORITY);
-	}
-
-	/* Put target rrset to ANSWER\AUTHORIRY as well as corresponding RRSIG */
-	int err = zi_rrset_put(z_import, answer, rr);
-	if (err != 0) {
-		goto cleanup;
-	}
-
-	if (!is_referral) {
-		knot_wire_set_aa(answer->wire);
-	} else {
-		/* Type is KNOT_RRTYPE_NS and owner is not equal to origin.
-		 * It will be "referral" answer and must contain delegation. */
-		err = zi_put_delegation(z_import, answer, rr);
-		if (err < 0) {
-			goto cleanup;
-		}
-	}
-
-	knot_pkt_begin(answer, KNOT_ADDITIONAL);
-
-	if (rrtype == KNOT_RRTYPE_NS) {
-		/* Try to find glue addresses. */
-		err = zi_put_glue(z_import, answer, rr);
-		if (err < 0) {
-			goto cleanup;
-		}
-	}
-
-	knot_wire_set_id(answer->wire, msgid);
-	answer->parsed = answer->size;
-	err = knot_pkt_parse(answer, 0);
-	if (err != KNOT_EOK) {
-		goto cleanup;
-	}
-
-	/* Importing doesn't imply communication with upstream at all.
-	 * "answer" contains pseudo-answer from upstream and must be successfully
-	 * validated in CONSUME stage. If not, something gone wrong. */
-	state = kr_resolve_consume(request, NULL, answer);
-
-cleanup:
-
-	knot_pkt_free(query);
-	knot_pkt_free(answer);
-	worker_task_finalize(task, state);
-	return state == (is_referral ? KR_STATE_PRODUCE : KR_STATE_DONE) ? 0 : -1;
-}
-
-/** @internal Create element in qr_rrsetlist_t rrset_list for
- * given node of map_t rrset_sorted.  */
-static int zi_rrsets_preprocess(trie_val_t *rr_p, void *z_import_v)
+/**
+ * @internal Import given rrset to cache.
+ *
+ * @return 0; let's keep importing even if some RRset fails
+ */
+static int zi_rrset_import(trie_val_t *rr_p, void *z_import_v)
 {
 	zone_import_ctx_t *z_import = z_import_v;
-	int ret = array_push_mm(z_import->rrset_sorted, *rr_p, kr_memreserve, &z_import->pool);
-	return ret < 0 ? ret : kr_ok();
+	knot_rrset_t *rr = *rr_p;
+
+	if (rr->type == KNOT_RRTYPE_RRSIG)
+		return 0; // we do RRSIGs at once with their types
+
+	// Determine if this RRset is authoritative.
+	// We utilize that iteration happens in canonical order.
+	// BUG (rare): `A` exactly on zone cut would be misdetected and fail validation.
+	bool is_auth;
+	const int kdib = knot_dname_in_bailiwick(rr->owner, z_import->last_cut);
+	if (kdib == 0 && (rr->type == KNOT_RRTYPE_DS || rr->type == KNOT_RRTYPE_NSEC
+				|| rr->type == KNOT_RRTYPE_NSEC3)) {
+		// parent side of the zone cut (well, presumably in case of NSEC*)
+		is_auth = true;
+	} else if (kdib >= 0) {
+		// inside non-auth subtree
+		is_auth = false;
+	} else if (rr->type == KNOT_RRTYPE_NS
+			&& knot_dname_in_bailiwick(rr->owner, z_import->origin) > 0) {
+		// entering non-auth subtree
+		z_import->last_cut = rr->owner;
+		is_auth = false;
+	} else {
+		// outside non-auth subtree
+		is_auth = true;
+		z_import->last_cut = NULL; // so that the next _in_bailiwick() is faster
+	}
+
+	// Get the corresponding RRSIGs if authoritative.
+	// LATER: improve logging here and below?
+	const knot_rrset_t *rrsig = NULL;
+	if (is_auth) {
+		char key_buf[KEY_LEN], *key;
+		const int len = key_get(key_buf, rr->owner,
+					KNOT_RRTYPE_RRSIG, rr->type, &key);
+		if (len < 0)
+			return 0;
+		const trie_val_t *rrsig_p = trie_get_try(z_import->rrsets, key, len);
+		if (!rrsig_p) {
+			KR_DNAME_GET_STR(owner_str, rr->owner);
+			KR_RRTYPE_GET_STR(type_str, rr->type);
+			kr_log_error(PREFILL, "no records found for %s RRSIG %s\n",
+					owner_str, type_str);
+			return 0;
+		}
+		rrsig = *rrsig_p;
+	}
+
+	int ret = is_auth ? kr_svldr_rrset(rr, &rrsig->rrs, z_import->svldr) : kr_ok();
+	if (ret) {
+		kr_log_error(PREFILL, "validation of this RRset failed: %s\n",
+				kr_strerror(ret));
+		return 0;
+	}
+
+	// TODO: re-check TTL+timestamp handling.  (downloaded file might be older)
+	const uint8_t rank = is_auth ? KR_RANK_AUTH|KR_RANK_SECURE : KR_RANK_OMIT;
+	ret = kr_cache_insert_rr(&the_worker->engine->resolver.cache, rr, rrsig,
+				 rank, z_import->timestamp_rr);
+	if (ret) {
+		kr_log_error(PREFILL, "caching this RRset failed: %s\n",
+				kr_strerror(ret));
+		return 0;
+	}
+	return 0; // Success, unlike all other returns.
 }
 
 /** @internal Iterate over parsed rrsets and try to import each of them. */
@@ -658,161 +470,22 @@ static void zi_zone_process(uv_timer_t* handle)
 {
 	zone_import_ctx_t *z_import = (zone_import_ctx_t *)handle->data;
 
-	size_t failed = 0;
-	size_t ns_imported = 0;
-	size_t other_imported = 0;
-
-	if (kr_fails_assert(z_import->worker)) {
-		failed = 1;
-		goto finish;
-	}
-
-	/* At the moment import of root zone only is supported.
-	 * Check the name of the parsed zone.
-	 * TODO - implement importing of arbitrary zone. */
 	KR_DNAME_GET_STR(zone_name_str, z_import->origin);
 
-	if (strcmp(".", zone_name_str) != 0) {
-		kr_log_error(PREFILL, "unexpected zone name `%s` (root zone expected), fail\n",
-			     zone_name_str);
-		failed = 1;
-		goto finish;
-	}
 
-	if (z_import->rrset_sorted.len <= 0) {
-		kr_log_error(PREFILL, "zone `%s` is empty\n", zone_name_str);
-		goto finish;
-	}
+	trie_apply(z_import->rrsets, zi_rrset_import, z_import);
 
-	/* TA have been found, zone is secured.
-	 * DNSKEY must be somewhere amongst the imported records. Find it.
-	 * TODO - For those zones that provenly do not have TA this step must be skipped. */
-	char key_buf[KEY_LEN], *key;
-	const int len = key_get(key_buf, z_import->origin, KNOT_RRTYPE_DNSKEY, 0, &key);
-	if (len < 0) {
-		failed = 1;
-		goto finish;
-	}
-	const trie_val_t *rr_p = trie_get_try(z_import->rrsets, key, len);
-	if (!rr_p) {
-		/* DNSKEY MUST be here. If not found - fail. */
-		kr_log_error(PREFILL, "DNSKEY not found for `%s`, fail\n", zone_name_str);
-		failed = 1;
-		goto finish;
-	}
-	knot_rrset_t * const rr_key = z_import->key = *rr_p;
+	kr_svldr_free_ctx(z_import->svldr);
+	z_import->svldr = NULL;
 
-	map_t *trust_anchors = &z_import->worker->engine->resolver.trust_anchors;
-	knot_rrset_t *rr_ta = kr_ta_get(trust_anchors, z_import->origin);
-	if (!rr_ta) {
-		kr_log_error(PREFILL, "error: TA for zone `%s` vanished, fail", zone_name_str);
-		failed = 1;
-		goto finish;
-	}
-	z_import->ta = rr_ta;
 
-	kr_log_debug(PREFILL, "import started for zone: '%s'\n", zone_name_str);
+	kr_log_debug(PREFILL, "finished importing `%s`\n", zone_name_str);
 
-	z_import->start_timestamp = kr_now();
-
-	/* Import DNSKEY at first step. If any validation problems will appear,
-	 * cancel import of whole zone. */
-	KR_DNAME_GET_STR(kname_str, rr_key->owner);
-	KR_RRTYPE_GET_STR(ktype_str, rr_key->type);
-
-	kr_log_debug(PREFILL, "importing: name: '%s' type: '%s'\n",
-		    kname_str, ktype_str);
-
-	int res = zi_rrset_import(z_import, rr_key);
-	if (res != 0) {
-		kr_log_error(PREFILL, "import failed: qname: '%s' type: '%s'\n",
-			    kname_str, ktype_str);
-		failed = 1;
-		goto finish;
-	}
-
-	/* Import all NS records */
-	for (size_t i = 0; i < z_import->rrset_sorted.len; ++i) {
-		knot_rrset_t *rr = z_import->rrset_sorted.at[i];
-
-		if (rr->type != KNOT_RRTYPE_NS) {
-			continue;
-		}
-
-		KR_DNAME_GET_STR(name_str, rr->owner);
-		KR_RRTYPE_GET_STR(type_str, rr->type);
-		kr_log_debug(PREFILL, "importing: name: '%s' type: '%s'\n",
-			    name_str, type_str);
-		int ret = zi_rrset_import(z_import, rr);
-		if (ret == 0) {
-			++ns_imported;
-		} else {
-			kr_log_debug(PREFILL, "import failed: name: '%s' type: '%s'\n",
-				    name_str, type_str);
-			++failed;
-		}
-		z_import->rrset_sorted.at[i] = NULL;
-	}
-
-	/* NS records have been imported as well as relative DS, NSEC* and glue.
-	 * Now import what's left. */
-	for (size_t i = 0; i < z_import->rrset_sorted.len; ++i) {
-
-		knot_rrset_t *rr = z_import->rrset_sorted.at[i];
-		if (rr == NULL) {
-			continue;
-		}
-
-		if (zi_rrset_is_marked_as_imported(rr)) {
-			continue;
-		}
-
-		if (rr->type == KNOT_RRTYPE_DNSKEY || rr->type == KNOT_RRTYPE_RRSIG) {
-			continue;
-		}
-
-		KR_DNAME_GET_STR(name_str, rr->owner);
-		KR_RRTYPE_GET_STR(type_str, rr->type);
-		kr_log_debug(PREFILL, "importing: name: '%s' type: '%s'\n",
-			    name_str, type_str);
-		res = zi_rrset_import(z_import, rr);
-		if (res == 0) {
-			++other_imported;
-		} else {
-			kr_log_debug(PREFILL, "import failed: name: '%s' type: '%s'\n",
-				    name_str, type_str);
-			++failed;
-		}
-	}
-
-	uint64_t elapsed = kr_now() - z_import->start_timestamp;
-	elapsed = elapsed > UINT_MAX ? UINT_MAX : elapsed;
-
-	kr_log_debug(PREFILL, "finished in %"PRIu64" ms; zone: `%s`; ns: %zd"
-		    "; other: %zd; failed: %zd\n",
-		    elapsed, zone_name_str, ns_imported, other_imported, failed);
-
-finish:
-
-	uv_timer_stop(&z_import->timer);
+	// FIXME: review all below
 	z_import->started = false;
 
-	int import_state = 0;
-
-	if (failed != 0) {
-		if (ns_imported == 0 && other_imported == 0) {
-			import_state = -1;
-			kr_log_error(PREFILL, "import failed; zone `%s` \n", zone_name_str);
-		} else {
-			import_state = 1;
-		}
-	} else {
-		import_state = 0;
-	}
-
-	if (z_import->cb != NULL) {
-		z_import->cb(import_state, z_import->cb_param);
-	}
+	if (z_import->cb != NULL)
+		z_import->cb(kr_ok(), z_import->cb_param);
 }
 
 /** @internal Store rrset that has been imported to zone import context memory pool.
@@ -879,7 +552,6 @@ static int zi_record_store(zs_scanner_t *s)
 	return 0;
 }
 
-/** @internal zscanner callback. */
 static int zi_state_parsing(zs_scanner_t *s)
 {
 	bool empty = true;
@@ -936,19 +608,14 @@ int zi_zone_import(struct zone_import_ctx *z_import,
 	if (kr_fails_assert(z_import && z_import->worker && zone_file))
 		return -1;
 
-	zs_scanner_t *s = malloc(sizeof(zs_scanner_t));
-	if (s == NULL) {
-		kr_log_error(PREFILL, "error creating instance of zone scanner (malloc() fails)\n");
-		return -1;
-	}
-
+   //// Parse the whole zone file into z_import->rrsets.
+	zs_scanner_t s_storage, *s = &s_storage;
 	/* zs_init(), zs_set_input_file(), zs_set_processing() returns -1 in case of error,
 	 * so don't print error code as it meaningless. */
 	int res = zs_init(s, origin, rclass, ttl);
 	if (res != 0) {
 		kr_log_error(PREFILL, "error initializing zone scanner instance, error: %i (%s)\n",
 			     s->error.code, zs_strerror(s->error.code));
-		free(s);
 		return -1;
 	}
 
@@ -957,7 +624,6 @@ int zi_zone_import(struct zone_import_ctx *z_import,
 		kr_log_error(PREFILL, "error opening zone file `%s`, error: %i (%s)\n",
 			     zone_file, s->error.code, zs_strerror(s->error.code));
 		zs_deinit(s);
-		free(s);
 		return -1;
 	}
 
@@ -969,11 +635,9 @@ int zi_zone_import(struct zone_import_ctx *z_import,
 				"error: %i (%s)\n",
 				zone_file, s->error.code, zs_strerror(s->error.code));
 		zs_deinit(s);
-		free(s);
 		return -1;
 	}
 
-	uint64_t elapsed = 0;
 	int ret = zi_reset(z_import, 4096);
 	if (ret == 0) {
 		z_import->started = true;
@@ -981,23 +645,8 @@ int zi_zone_import(struct zone_import_ctx *z_import,
 		kr_log_debug(PREFILL, "import started for zone file `%s`\n",
 			    zone_file);
 		ret = zi_state_parsing(s);
-		if (ret == 0) {
-			/* Try to find TA for worker->z_import.origin. */
-			map_t *trust_anchors = &z_import->worker->engine->resolver.trust_anchors;
-			knot_rrset_t *rr = kr_ta_get(trust_anchors, z_import->origin);
-			if (!rr) {
-				/* For now - fail.
-				 * TODO - query DS and continue after answer had been obtained. */
-				KR_DNAME_GET_STR(zone_name_str, z_import->origin);
-				kr_log_error(PREFILL, "no TA found for `%s`, fail\n", zone_name_str);
-				ret = 1;
-			}
-			elapsed = kr_now() - z_import->start_timestamp;
-			elapsed = elapsed > UINT_MAX ? UINT_MAX : elapsed;
-		}
 	}
 	zs_deinit(s);
-	free(s);
 
 	if (ret != 0) {
 		kr_log_error(PREFILL, "error parsing zone file `%s`\n", zone_file);
@@ -1005,19 +654,76 @@ int zi_zone_import(struct zone_import_ctx *z_import,
 		return ret;
 	}
 
+	KR_DNAME_GET_STR(zone_name_str, z_import->origin);
+	// TODO: basic sanity checks?  For example, non-zero record count?
+	{ // FIXME: get stamp from the file instead, and maybe check against OS time.
+		struct timespec now;
+		if (clock_gettime(CLOCK_REALTIME, &now)) {
+			ret = kr_error(errno);
+			kr_log_error(PREFILL, "failed to get current time: %s\n",
+					kr_strerror(ret));
+			return ret;
+		}
+		z_import->timestamp_rr = now.tv_sec;
+	}
+
+   //// Initialize validator context with the DNSKEY.
+	// TODO: for now we assume that the DS comes from pre-configured trust anchors;
+	// later we should be able to fetch it from DNS, practically allowing non-root zones.
+	const knot_rrset_t *ds = kr_ta_get(&the_worker->engine->resolver.trust_anchors,
+						z_import->origin);
+	if (!ds) {
+		kr_log_error(PREFILL, "no DS found for `%s`, fail\n", zone_name_str);
+		return -1;
+	}
+
+	knot_rrset_t *dnskey = NULL, *dnskey_sigs = NULL;
+	{
+		char key_buf[KEY_LEN], *key;
+		int len = key_get(key_buf, z_import->origin,
+					KNOT_RRTYPE_DNSKEY, 0, &key);
+		trie_val_t *rr_p;
+		if (len >= 0) {
+			rr_p = trie_get_try(z_import->rrsets, key, len);
+			if (rr_p)
+				dnskey = *rr_p;
+		}
+		if (!dnskey) {
+			kr_log_error(PREFILL, "no DNSKEY found for `%s`, fail: %s\n",
+					zone_name_str,
+					kr_strerror(len >= 0 ? len : kr_error(ENOENT)));
+			return -1;
+		}
+
+		len = key_get(key_buf, z_import->origin,
+				KNOT_RRTYPE_RRSIG, KNOT_RRTYPE_DNSKEY, &key);
+		if (len >= 0) {
+			rr_p = trie_get_try(z_import->rrsets, key, len);
+			if (rr_p)
+				dnskey_sigs = *rr_p;
+		}
+		if (!dnskey_sigs) {
+			kr_log_error(PREFILL, "no RRSIGs for DNSKEY found for `%s`, fail: %s\n",
+					zone_name_str,
+					kr_strerror(len >= 0 ? len : kr_error(ENOENT)));
+			return -1;
+		}
+	}
+
+	z_import->svldr = kr_svldr_new_ctx(ds, dnskey, &dnskey_sigs->rrs,
+						z_import->timestamp_rr);
+	if (!z_import->svldr) {
+		kr_log_error(PREFILL, "failed to validate DNSKEY for `%s`\n", zone_name_str);
+		return -1;
+	}
+
 #if ENABLE_ZONEMD
-	// FIXME: DNSSEC verify the ZONEMD RR set before this.
 	ret = zonemd_verify(z_import);
 	//if (ret) return ret;
 #endif
 
-	kr_log_debug(PREFILL, "import finished in %"PRIu64" ms; zone file `%s`\n",
-			    elapsed, zone_file);
-	trie_apply(z_import->rrsets, zi_rrsets_preprocess, z_import);
-
 	/* Zone have been parsed already, so start the import. */
-	uv_timer_start(&z_import->timer, zi_zone_process,
-		       ZONE_IMPORT_PAUSE, ZONE_IMPORT_PAUSE);
+	uv_timer_start(&z_import->timer, zi_zone_process, ZONE_IMPORT_PAUSE, 0);
 
 	return 0;
 }
