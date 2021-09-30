@@ -402,7 +402,6 @@ static int zi_rrset_import(trie_val_t *rr_p, void *z_import_v)
 
 	// Determine if this RRset is authoritative.
 	// We utilize that iteration happens in canonical order.
-	// BUG (rare): `A` exactly on zone cut would be misdetected and fail validation.
 	bool is_auth;
 	const int kdib = knot_dname_in_bailiwick(rr->owner, z_import->last_cut);
 	if (kdib == 0 && (rr->type == KNOT_RRTYPE_DS || rr->type == KNOT_RRTYPE_NSEC
@@ -421,6 +420,12 @@ static int zi_rrset_import(trie_val_t *rr_p, void *z_import_v)
 		// outside non-auth subtree
 		is_auth = true;
 		z_import->last_cut = NULL; // so that the next _in_bailiwick() is faster
+	}
+	// Rare case: `A` exactly on zone cut would be misdetected and fail validation;
+	// it's the only type ordered before NS.
+	if (unlikely(is_auth && rr->type < KNOT_RRTYPE_NS)) {
+		if (rrset_get(z_import->rrsets, rr->owner, KNOT_RRTYPE_NS, 0))
+			is_auth = false;
 	}
 
 	// Get and validate the corresponding RRSIGs, if authoritative.
@@ -444,6 +449,7 @@ static int zi_rrset_import(trie_val_t *rr_p, void *z_import_v)
 	}
 
 	// TODO: re-check TTL+timestamp handling.  (downloaded file might be older)
+	// TODO: no NSEC* params; that's not ideal and e.g. breaks test_apex() cache test.
 	const uint8_t rank = is_auth ? KR_RANK_AUTH|KR_RANK_SECURE : KR_RANK_OMIT;
 	int ret = kr_cache_insert_rr(&the_worker->engine->resolver.cache, rr, rrsig,
 					rank, z_import->timestamp_rr);
