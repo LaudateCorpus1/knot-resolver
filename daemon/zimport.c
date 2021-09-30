@@ -95,7 +95,10 @@ typedef struct zone_import_ctx zone_import_ctx_t;
 
 
 #define KEY_LEN (KNOT_DNAME_MAXLEN + 1 + 2 + 2)
-/** Construct key for name, type and signed type (if type == RRSIG).  ZONEMD order! */
+/** Construct key for name, type and signed type (if type == RRSIG).  ZONEMD order!
+ *
+ * Return negative error code in asserted cases.
+ */
 static int key_get(char buf[KEY_LEN], const knot_dname_t *name,
 		uint16_t type, uint16_t type_maysig, char **key_p)
 {
@@ -112,6 +115,21 @@ static int key_get(char buf[KEY_LEN], const knot_dname_t *name,
 		memcpy(buf + KNOT_DNAME_MAXLEN + 1 + sizeof(type),
 			&type_maysig, sizeof(type_maysig));
 	return *lf_len_p + 1 + sizeof(type) * (1 + (type == KNOT_RRTYPE_RRSIG));
+}
+
+/** Simple helper to retreive from zone_import_ctx_t::rrsets */
+static knot_rrset_t * rrset_get(trie_t *rrsets, const knot_dname_t *name,
+				uint16_t type, uint16_t type_maysig)
+{
+	char key_buf[KEY_LEN], *key;
+	const int len = key_get(key_buf, name, type, type_maysig, &key);
+	if (len < 0)
+		return NULL;
+	const trie_val_t *rrsig_p = trie_get_try(rrsets, key, len);
+	if (!rrsig_p)
+		return NULL;
+	kr_assert(*rrsig_p);
+	return *rrsig_p;
 }
 
 #if ENABLE_ZONEMD
@@ -151,31 +169,17 @@ static int zonemd_verify(zone_import_ctx_t *z_import)
 {
 	bool zonemd_is_valid = false;
 	// Find ZONEMD RR + RRSIG
-	knot_rrset_t *rr_zonemd = NULL, *rrsig_zonemd = NULL;
-	{
-		char key_buf[KEY_LEN], *key;
-		int len = key_get(key_buf, z_import->origin,
-					KNOT_RRTYPE_ZONEMD, 0, &key);
-		if (len < 0)
-			return kr_error(len);
-		const trie_val_t *rr_p = trie_get_try(z_import->rrsets, key, len);
-		if (rr_p) {
-			rr_zonemd = *rr_p;
-			if (kr_fails_assert(rr_zonemd))
-				return kr_error(EINVAL);
-		} else {
-			// no zonemd; let's compute digest and throw an error afterwards
-			z_import->digests[KNOT_ZONEMD_ALORITHM_SHA384 - 1].active = true;
-			//z_import->digests[KNOT_ZONEMD_ALORITHM_SHA512 - 1].active = true;
-			goto do_digest;
-		}
-
-		len = key_get(key_buf, z_import->origin,
-				KNOT_RRTYPE_RRSIG, KNOT_RRTYPE_ZONEMD, &key);
-		const trie_val_t *rrsig_p = trie_get_try(z_import->rrsets, key, len);
-		if (rrsig_p)
-			rrsig_zonemd = *rrsig_p;
+	knot_rrset_t * const rr_zonemd
+		= rrset_get(z_import->rrsets, z_import->origin, KNOT_RRTYPE_ZONEMD, 0);
+	if (!rr_zonemd) {
+		// no zonemd; let's compute digest and throw an error afterwards
+		z_import->digests[KNOT_ZONEMD_ALORITHM_SHA384 - 1].active = true;
+		//z_import->digests[KNOT_ZONEMD_ALORITHM_SHA512 - 1].active = true;
+		goto do_digest;
 	}
+	const knot_rrset_t * const rrsig_zonemd
+		= rrset_get(z_import->rrsets, z_import->origin,
+				KNOT_RRTYPE_RRSIG, KNOT_RRTYPE_ZONEMD);
 	// Validate ZONEMD RRSIG
 	{
 		int ret = rrsig_zonemd
@@ -189,19 +193,12 @@ static int zonemd_verify(zone_import_ctx_t *z_import)
 	// Get SOA serial
 	uint32_t soa_serial = -1;
 	{
-		char key_buf[KEY_LEN], *key;
-		const int len = key_get(key_buf, z_import->origin,
-					KNOT_RRTYPE_SOA, 0, &key);
-		if (len < 0)
-			return kr_error(len);
-		const trie_val_t *rr_p = trie_get_try(z_import->rrsets, key, len);
-		if (!rr_p) {
+		const knot_rrset_t *soa = rrset_get(z_import->rrsets, z_import->origin,
+							KNOT_RRTYPE_SOA, 0);
+		if (!soa) {
 			kr_log_error(PREFILL, "SOA record not found\n");
 			return kr_error(ENOENT);
 		}
-		const knot_rrset_t *soa = *rr_p;
-		if (kr_fails_assert(soa))
-			return kr_error(EINVAL);
 		if (soa->rrs.count != 1) {
 			kr_log_error(PREFILL, "the SOA RR set is weird\n");
 			return kr_error(EINVAL);
@@ -426,37 +423,30 @@ static int zi_rrset_import(trie_val_t *rr_p, void *z_import_v)
 		z_import->last_cut = NULL; // so that the next _in_bailiwick() is faster
 	}
 
-	// Get the corresponding RRSIGs if authoritative.
+	// Get and validate the corresponding RRSIGs, if authoritative.
 	// LATER: improve logging here and below?
 	const knot_rrset_t *rrsig = NULL;
 	if (is_auth) {
-		char key_buf[KEY_LEN], *key;
-		const int len = key_get(key_buf, rr->owner,
-					KNOT_RRTYPE_RRSIG, rr->type, &key);
-		if (len < 0)
-			return 0;
-		const trie_val_t *rrsig_p = trie_get_try(z_import->rrsets, key, len);
-		if (!rrsig_p) {
+		rrsig = rrset_get(z_import->rrsets, rr->owner, KNOT_RRTYPE_RRSIG, rr->type);
+		if (unlikely(!rrsig)) {
 			KR_DNAME_GET_STR(owner_str, rr->owner);
 			KR_RRTYPE_GET_STR(type_str, rr->type);
 			kr_log_error(PREFILL, "no records found for %s RRSIG %s\n",
 					owner_str, type_str);
 			return 0;
 		}
-		rrsig = *rrsig_p;
-	}
-
-	int ret = is_auth ? kr_svldr_rrset(rr, &rrsig->rrs, z_import->svldr) : kr_ok();
-	if (ret) {
-		kr_log_error(PREFILL, "validation of this RRset failed: %s\n",
-				kr_strerror(ret));
-		return 0;
+		int ret = kr_svldr_rrset(rr, &rrsig->rrs, z_import->svldr);
+		if (unlikely(ret)) {
+			kr_log_error(PREFILL, "validation of this RRset failed: %s\n",
+					kr_strerror(ret));
+			return 0;
+		}
 	}
 
 	// TODO: re-check TTL+timestamp handling.  (downloaded file might be older)
 	const uint8_t rank = is_auth ? KR_RANK_AUTH|KR_RANK_SECURE : KR_RANK_OMIT;
-	ret = kr_cache_insert_rr(&the_worker->engine->resolver.cache, rr, rrsig,
-				 rank, z_import->timestamp_rr);
+	int ret = kr_cache_insert_rr(&the_worker->engine->resolver.cache, rr, rrsig,
+					rank, z_import->timestamp_rr);
 	if (ret) {
 		kr_log_error(PREFILL, "caching this RRset failed: %s\n",
 				kr_strerror(ret));
@@ -670,44 +660,25 @@ int zi_zone_import(struct zone_import_ctx *z_import,
    //// Initialize validator context with the DNSKEY.
 	// TODO: for now we assume that the DS comes from pre-configured trust anchors;
 	// later we should be able to fetch it from DNS, practically allowing non-root zones.
-	const knot_rrset_t *ds = kr_ta_get(&the_worker->engine->resolver.trust_anchors,
-						z_import->origin);
+	const knot_rrset_t * const ds =
+		kr_ta_get(&the_worker->engine->resolver.trust_anchors, z_import->origin);
 	if (!ds) {
 		kr_log_error(PREFILL, "no DS found for `%s`, fail\n", zone_name_str);
 		return -1;
 	}
 
-	knot_rrset_t *dnskey = NULL, *dnskey_sigs = NULL;
-	{
-		char key_buf[KEY_LEN], *key;
-		int len = key_get(key_buf, z_import->origin,
-					KNOT_RRTYPE_DNSKEY, 0, &key);
-		trie_val_t *rr_p;
-		if (len >= 0) {
-			rr_p = trie_get_try(z_import->rrsets, key, len);
-			if (rr_p)
-				dnskey = *rr_p;
-		}
-		if (!dnskey) {
-			kr_log_error(PREFILL, "no DNSKEY found for `%s`, fail: %s\n",
-					zone_name_str,
-					kr_strerror(len >= 0 ? len : kr_error(ENOENT)));
-			return -1;
-		}
-
-		len = key_get(key_buf, z_import->origin,
-				KNOT_RRTYPE_RRSIG, KNOT_RRTYPE_DNSKEY, &key);
-		if (len >= 0) {
-			rr_p = trie_get_try(z_import->rrsets, key, len);
-			if (rr_p)
-				dnskey_sigs = *rr_p;
-		}
-		if (!dnskey_sigs) {
-			kr_log_error(PREFILL, "no RRSIGs for DNSKEY found for `%s`, fail: %s\n",
-					zone_name_str,
-					kr_strerror(len >= 0 ? len : kr_error(ENOENT)));
-			return -1;
-		}
+	knot_rrset_t * const dnskey = rrset_get(z_import->rrsets, z_import->origin,
+						KNOT_RRTYPE_DNSKEY, 0);
+	if (!dnskey) {
+		kr_log_error(PREFILL, "no DNSKEY found for `%s`, fail\n", zone_name_str);
+		return -1;
+	}
+	knot_rrset_t * const dnskey_sigs = rrset_get(z_import->rrsets, z_import->origin,
+						KNOT_RRTYPE_RRSIG, KNOT_RRTYPE_DNSKEY);
+	if (!dnskey_sigs) {
+		kr_log_error(PREFILL, "no RRSIGs for DNSKEY found for `%s`, fail\n",
+				zone_name_str);
+		return -1;
 	}
 
 	z_import->svldr = kr_svldr_new_ctx(ds, dnskey, &dnskey_sigs->rrs,
