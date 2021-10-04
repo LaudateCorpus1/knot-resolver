@@ -68,6 +68,7 @@ local function import_root_no_soa()
 	ok(cache.count() == 0 , 'cache is still empty after import of zone without SOA record')
 end
 
+--[[
 local function import_unsigned_root_zone() -- FIXME: add option to allow importing unsigned zones?
 	cache.clear()
 	local import_res = cache.zone_import('testroot.zone.unsigned')
@@ -87,6 +88,7 @@ local function import_not_root_zone() -- FIXME: add option to allow importing un
 	-- sanity checks - cache must be filled in
 	ok(cache.count() == 0, 'cache is still empty after import of other zone than root')
 end
+--]]
 
 local function import_empty_zone()
 	cache.clear()
