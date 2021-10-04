@@ -400,6 +400,7 @@ static int zi_rrset_import(trie_val_t *rr_p, void *z_import_v)
 	if (rr->type == KNOT_RRTYPE_RRSIG)
 		return 0; // we do RRSIGs at once with their types
 
+	const int origin_bailiwick = knot_dname_in_bailiwick(rr->owner, z_import->origin);
 	// Determine if this RRset is authoritative.
 	// We utilize that iteration happens in canonical order.
 	bool is_auth;
@@ -411,8 +412,7 @@ static int zi_rrset_import(trie_val_t *rr_p, void *z_import_v)
 	} else if (kdib >= 0) {
 		// inside non-auth subtree
 		is_auth = false;
-	} else if (rr->type == KNOT_RRTYPE_NS
-			&& knot_dname_in_bailiwick(rr->owner, z_import->origin) > 0) {
+	} else if (rr->type == KNOT_RRTYPE_NS && origin_bailiwick > 0) {
 		// entering non-auth subtree
 		z_import->last_cut = rr->owner;
 		is_auth = false;
@@ -452,7 +452,9 @@ static int zi_rrset_import(trie_val_t *rr_p, void *z_import_v)
 	// TODO: no NSEC* params; that's not ideal and e.g. breaks test_apex() cache test.
 	const uint8_t rank = is_auth ? KR_RANK_AUTH|KR_RANK_SECURE : KR_RANK_OMIT;
 	int ret = kr_cache_insert_rr(&the_worker->engine->resolver.cache, rr, rrsig,
-					rank, z_import->timestamp_rr);
+					rank, z_import->timestamp_rr,
+					// Optim.: only stash NSEC* params at the apex.
+					origin_bailiwick == 0);
 	if (ret) {
 		kr_log_error(PREFILL, "caching this RRset failed: %s\n",
 				kr_strerror(ret));
