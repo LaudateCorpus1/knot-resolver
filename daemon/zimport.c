@@ -36,9 +36,11 @@
 
 #include <inttypes.h> /* PRIu64 */
 #include <limits.h>
+#include <math.h>
 #include <stdlib.h>
 #include <uv.h>
-#include <ucw/mempool.h>
+
+#include "contrib/ucw/mempool.h"
 #include <libknot/rrset.h>
 #include <libzscanner/scanner.h>
 
@@ -66,7 +68,6 @@ struct zone_import_ctx {
 	knot_dname_t *origin;
 	knot_rrset_t *ta;
 	knot_rrset_t *key;
-	uint64_t start_timestamp;
 	size_t rrset_idx;
 	uv_timer_t timer;
 	knot_mm_t pool;
@@ -322,7 +323,6 @@ static int zi_reset(struct zone_import_ctx *z_import, size_t rrset_sorted_list_s
 	mp_flush(z_import->pool.ctx);
 
 	z_import->started = false;
-	z_import->start_timestamp = 0;
 	z_import->rrset_idx = 0;
 	z_import->pool.alloc = (knot_mm_alloc_t) mp_alloc;
 	z_import->rrsets = trie_create(&z_import->pool);
@@ -376,7 +376,6 @@ zone_import_ctx_t *zi_allocate(struct worker_ctx *worker,
 void zi_free(zone_import_ctx_t *z_import)
 {
 	z_import->started = false;
-	z_import->start_timestamp = 0;
 	z_import->rrset_idx = 0;
 	mp_delete(z_import->pool.ctx);
 	z_import->pool.ctx = NULL;
@@ -470,8 +469,13 @@ static void zi_zone_process(uv_timer_t* handle)
 
 	KR_DNAME_GET_STR(zone_name_str, z_import->origin);
 
+	kr_timer_t stopwatch;
+	kr_timer_start(&stopwatch);
 
 	trie_apply(z_import->rrsets, zi_rrset_import, z_import);
+
+	kr_log_info(PREFILL, "performance: validating and caching in %.3lf s\n",
+			kr_timer_elapsed(&stopwatch));
 
 	kr_svldr_free_ctx(z_import->svldr);
 	z_import->svldr = NULL;
@@ -606,6 +610,9 @@ int zi_zone_import(struct zone_import_ctx *z_import,
 	if (kr_fails_assert(z_import && z_import->worker && zone_file))
 		return -1;
 
+	kr_timer_t stopwatch;
+	kr_timer_start(&stopwatch);
+
    //// Parse the whole zone file into z_import->rrsets.
 	zs_scanner_t s_storage, *s = &s_storage;
 	/* zs_init(), zs_set_input_file(), zs_set_processing() returns -1 in case of error,
@@ -639,12 +646,12 @@ int zi_zone_import(struct zone_import_ctx *z_import,
 	int ret = zi_reset(z_import, 4096);
 	if (ret == 0) {
 		z_import->started = true;
-		z_import->start_timestamp = kr_now();
 		kr_log_debug(PREFILL, "import started for zone file `%s`\n",
 			    zone_file);
 		ret = zi_state_parsing(s);
 	}
 	zs_deinit(s);
+	const double time_parse = kr_timer_elapsed(&stopwatch);
 
 	if (ret != 0) {
 		kr_log_error(PREFILL, "error parsing zone file `%s`\n", zone_file);
@@ -697,9 +704,15 @@ int zi_zone_import(struct zone_import_ctx *z_import,
 	}
 
 #if ENABLE_ZONEMD
+	kr_timer_start(&stopwatch);
 	ret = zonemd_verify(z_import);
+	const double time_zonemd = kr_timer_elapsed(&stopwatch);
 	//if (ret) return ret;
+#else
+	const double time_zonemd = nan("");
 #endif
+	kr_log_info(PREFILL, "performance: parsing in %.3lf s, hashing in %.3lf s\n",
+			time_parse, time_zonemd);
 
 	/* Zone have been parsed already, so start the import. */
 	uv_timer_start(&z_import->timer, zi_zone_process, ZONE_IMPORT_PAUSE, 0);
