@@ -10,7 +10,7 @@ mock_cmodule_mod = shared_module(
   'mock_cmodule',
   mock_cmodule_src,
   name_prefix: '',
-  include_directories: include_directories('../../'),
+  include_directories: include_directories('../../', '../../contrib/'),
 )
 
 # executables with tests
