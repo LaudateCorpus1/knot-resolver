@@ -89,7 +89,9 @@ local function download(url, fname)
 end
 
 local function import(fname)
-	local res = cache.zone_import(fname)
+	local res = ffi.C.zi_zone_import({
+		zone_file = fname,
+	})
 	if res.code == 1 then -- no TA found, wait
 		error("[prefill] no trust anchor found for root zone, import aborted")
 	elseif res.code == 0 then

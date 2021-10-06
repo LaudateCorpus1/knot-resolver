@@ -44,10 +44,17 @@ env.KRESD_NO_LISTEN = true
 
 local check_answer = require('test_utils').check_answer
 
+local function zone_import(fname, downgrade)
+	return require('ffi').C.zi_zone_import({
+			zone_file = fname,
+			downgrade = downgrade,
+	})
+end
+
 local function import_valid_root_zone()
 	cache.clear()
-	local import_res = cache.zone_import('testroot.zone')
-	assert(import_res.code == 0)
+	local import_res = zone_import('testroot.zone')
+	assert(import_res == 0)
 	-- beware that import takes at least 100 ms
 	worker.sleep(0.2)  -- zimport is delayed by 100 ms from function call
 	-- sanity checks - cache must be filled in
@@ -60,40 +67,38 @@ end
 
 local function import_root_no_soa()
 	cache.clear()
-	local import_res = cache.zone_import('testroot_no_soa.zone')
-	assert(import_res.code == -1)
+	local import_res = zone_import('testroot_no_soa.zone')
+	assert(import_res == -1)
 	-- beware that import takes at least 100 ms
 	worker.sleep(0.2)  -- zimport is delayed by 100 ms from function call
 	-- sanity checks - cache must be filled in
 	ok(cache.count() == 0 , 'cache is still empty after import of zone without SOA record')
 end
 
---[[
-local function import_unsigned_root_zone() -- FIXME: add option to allow importing unsigned zones?
+local function import_unsigned_root_zone()
 	cache.clear()
-	local import_res = cache.zone_import('testroot.zone.unsigned')
-	assert(import_res.code == 0)
+	local import_res = zone_import('testroot.zone.unsigned', true)
+	assert(import_res == 0)
 	-- beware that import takes at least 100 ms
 	worker.sleep(0.2)  -- zimport is delayed by 100 ms from function call
 	-- sanity checks - cache must be filled in
 	ok(cache.count() == 0, 'cache is still empty after import of unsigned zone')
 end
 
-local function import_not_root_zone() -- FIXME: add option to allow importing unsigned zones?
+local function import_not_root_zone()
 	cache.clear()
-	local import_res = cache.zone_import('example.com.zone')
-	assert(import_res.code == 1)
+	local import_res = zone_import('example.com.zone', true)
+	assert(import_res == 0)
 	-- beware that import takes at least 100 ms
 	worker.sleep(0.2)  -- zimport is delayed by 100 ms from function call
 	-- sanity checks - cache must be filled in
 	ok(cache.count() == 0, 'cache is still empty after import of other zone than root')
 end
---]]
 
 local function import_empty_zone()
 	cache.clear()
-	local import_res = cache.zone_import('empty.zone')
-	assert(import_res.code == -1)
+	local import_res = zone_import('empty.zone')
+	assert(import_res < 0)
 	-- beware that import takes at least 100 ms
 	worker.sleep(0.2)  -- zimport is delayed by 100 ms from function call
 	-- sanity checks - cache must be filled in
@@ -102,8 +107,8 @@ end
 
 local function import_random_trash()
 	cache.clear()
-	local import_res = cache.zone_import('random.zone')
-	assert(import_res.code == -1)
+	local import_res = zone_import('random.zone')
+	assert(import_res < 0)
 	-- beware that import takes at least 100 ms
 	worker.sleep(0.2)  -- zimport is delayed by 100 ms from function call
 	-- sanity checks - cache must be filled in
@@ -113,8 +118,8 @@ end
 return {
 	import_valid_root_zone,
 	import_root_no_soa,
-	--import_unsigned_root_zone,
-	--import_not_root_zone,
+	import_unsigned_root_zone,
+	import_not_root_zone,
 	import_empty_zone,
 	import_random_trash,
 }

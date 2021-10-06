@@ -47,8 +47,8 @@ env.KRESD_NO_LISTEN = true
 
 
 local function import_zone()
-	local import_res = cache.zone_import('testroot.zone')
-	assert(import_res.code == 0)
+	local import_res = require('ffi').C.zi_zone_import({ zone_file = 'testroot.zone' })
+	assert(import_res == 0)
 	-- beware that import takes at least 100 ms
 	worker.sleep(0.2)  -- zimport is delayed by 100 ms from function call
 	-- sanity checks - cache must be filled in

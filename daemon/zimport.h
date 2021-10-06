@@ -5,53 +5,35 @@
 #pragma once
 
 #include <stdbool.h>
-#include <stdint.h>
-
-struct worker_ctx;
-/** Zone import context (opaque).  */
-struct zone_import_ctx;
+#include <libknot/rrset.h>
+#include "lib/defines.h"
 
 /**
  * Completion callback
  *
- * @param state -1 - fail
- *               0 - success
- *               1 - success, but there are non-critical errors
- * @param pointer to user data
+ * @param state  0 for now, < 0 for errors in future
+ * @param param  pointer to user data
  */
 typedef void (*zi_callback)(int state, void *param);
+typedef struct {
+	/* Parser, see zs_init() */
+	const char *zone_file;
+	const char *origin;
+	uint32_t ttl;
+	/* Validator */
+	bool downgrade; /// true -> disable validation
+	bool zonemd; /// true -> verify zonemd
+	const knot_rrset_t *ds; /// NULL -> use trust anchors
 
-/**
- * Allocate and initialize zone import context.
+	zi_callback cb;
+	void *cb_param;
+} zi_config_t;
+
+/** Import zone from a file.
  *
- * @param worker pointer to worker state
- * @return NULL or pointer to zone import context.
+ * Error can be directly returned in the first phase (parsing + ZONEMD);
+ * otherwise it will be kr_ok() and config->cb gets (optionally) called finally.
  */
-struct zone_import_ctx *zi_allocate(struct worker_ctx *worker,
-				    zi_callback cb, void *param);
+KR_EXPORT
+int zi_zone_import(const zi_config_t config);
 
-/** Free zone import context. */
-void zi_free(struct zone_import_ctx *z_import);
-
-/**
- * Import zone from file.
- *
- * @note only root zone import is supported; origin must be NULL or "."
- * @param z_import pointer to zone import context
- * @param zone_file zone file name
- * @param origin default origin
- * @param rclass default class
- * @param ttl    default ttl
- * @return 0 or an error code
- */
-int zi_zone_import(struct zone_import_ctx *z_import,
-		   const char *zone_file, const char *origin,
-		   uint16_t rclass, uint32_t ttl);
-
-/**
- * Check if import already in process.
- *
- * @param z_import pointer to zone import context.
- * @return true if import already in process; false otherwise.
- */
-bool zi_import_started(struct zone_import_ctx *z_import);
