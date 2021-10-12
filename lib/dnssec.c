@@ -91,10 +91,9 @@ static int validate_rrsig_rr(int *flags, int cov_labels,
 		}
 	}
 
-	/* bullet 7 */
-	if ((!knot_dname_is_equal(vctx->zone_name, signer_name)) ||
-	    (key_alg != knot_rrsig_alg(rrsigs)) ||
-	    (keytag != knot_rrsig_key_tag(rrsigs))) {
+	/* bullet 7
+	 * Part checked elsewhere: key owner matching the zone_name. */
+	if (key_alg != knot_rrsig_alg(rrsigs) || keytag != knot_rrsig_key_tag(rrsigs)) {
 		vctx->rrs_counters.key_invalid++;
 		return kr_error(EINVAL);
 	}
