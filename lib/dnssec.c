@@ -260,6 +260,8 @@ static int kr_svldr_rrset_with_key(knot_rrset_t *rrs, const knot_rdataset_t *rrs
 int kr_svldr_rrset(knot_rrset_t *rrs, const knot_rdataset_t *rrsigs,
 			struct kr_svldr_ctx *ctx)
 {
+	if (knot_dname_in_bailiwick(rrs->owner, ctx->vctx.zone_name) < 0)
+		return ctx->vctx.result = kr_error(EAGAIN);
 	for (ssize_t i = 0; i < ctx->keys.len; ++i) {
 		kr_svldr_rrset_with_key(rrs, rrsigs, &ctx->vctx, &ctx->keys.at[i]);
 		if (ctx->vctx.result == 0)
