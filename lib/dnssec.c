@@ -404,7 +404,8 @@ int kr_dnskeys_trusted(kr_rrset_validation_ctx_t *vctx, const knot_rdataset_t *s
 {
 	knot_rrset_t *keys = vctx->keys;
 	const bool ok = keys && ta && ta->rrs.count && ta->rrs.rdata
-			&& ta->type == KNOT_RRTYPE_DS;
+			&& ta->type == KNOT_RRTYPE_DS
+			&& knot_dname_is_equal(ta->owner, keys->owner);
 	if (kr_fails_assert(ok))
 		return kr_error(EINVAL);
 
