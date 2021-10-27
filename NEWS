@@ -11,6 +11,10 @@ Bugfixes
 - lua: log() works again; broken in 5.4.2 (!1223)
 - policy: correctly include EDNS0 previously omitted by some actions (!1230)
 
+Incompatible changes
+--------------------
+- libknot >= 3.0.2 is required
+
 
 Knot Resolver 5.4.2 (2021-10-13)
 ================================
