@@ -90,6 +90,7 @@ struct qr_task
 	uint64_t send_time;
 	uint64_t recv_time;
 	struct kr_transport *transport;
+	uv_timer_t timeout;
 };
 
 
@@ -498,7 +499,7 @@ static void request_free(struct request_ctx *ctx)
 	worker->stats.rconcurrent -= 1;
 }
 
-static struct qr_task *qr_task_create(struct request_ctx *ctx)
+static struct qr_task *qr_task_create(uv_loop_t* loop, struct request_ctx *ctx)
 {
 	/* Choose (initial) pktbuf size.  As it is now, pktbuf can be used
 	 * for UDP answers from upstream *and* from cache
@@ -533,6 +534,10 @@ static struct qr_task *qr_task_create(struct request_ctx *ctx)
 	qr_task_ref(task);
 	task->creation_time = kr_now();
 	ctx->worker->stats.concurrent += 1;
+
+	uv_timer_init(loop, &task->timeout);
+	task->timeout.data = task;
+
 	return task;
 }
 
@@ -1112,7 +1117,8 @@ static void on_tcp_connect_timeout(uv_timer_t *timer)
 			    peer_str ? peer_str : "");
 	}
 
-	qry->server_selection.error(qry, task->transport, KR_SELECTION_TCP_CONNECT_TIMEOUT);
+	if (qry)
+		qry->server_selection.error(qry, task->transport, KR_SELECTION_TCP_CONNECT_TIMEOUT);
 
 	worker->stats.timeout += session_waitinglist_get_len(session);
 	session_waitinglist_retry(session, true);
@@ -1321,6 +1327,13 @@ static int xdp_push(struct qr_task *task, const uv_handle_t *src_handle)
 #endif
 }
 
+static void qr_task_timeout_onclose(uv_handle_t* timer_handle)
+{
+	uv_timer_t* timer = (uv_timer_t*) timer_handle;
+	struct qr_task* task = timer->data;
+	qr_task_unref(task);
+}
+
 static int qr_task_finalize(struct qr_task *task, int state)
 {
 	kr_require(task && task->leading == false);
@@ -1330,6 +1343,10 @@ static int qr_task_finalize(struct qr_task *task, int state)
 	struct request_ctx *ctx = task->ctx;
 	struct session *source_session = ctx->source.session;
 	kr_resolve_finish(&ctx->req, state);
+
+	qr_task_ref(task);
+	uv_timer_stop(&task->timeout);
+	uv_close((uv_handle_t*) &task->timeout, qr_task_timeout_onclose);
 
 	task->finished = true;
 	if (source_session == NULL) {
@@ -1605,6 +1622,45 @@ static int tcp_task_step(struct qr_task *task,
 	return ret;
 }
 
+static void qr_task_timeout(uv_timer_t* timer)
+{
+	/* A task may time out when no data is received on an otherwise valid
+	 * TCP connection. */
+
+	struct qr_task *task = timer->data;
+
+	/* Find connected TCP session for this task. If none exists,
+	 * no timeout logic is currently defined. There are also session-level
+	 * timeouts in the resolver that handle the other cases. */
+	const struct sockaddr* addr = &task->transport->address.ip;
+	struct session *session = worker_find_tcp_connected(
+			task->ctx->worker, addr);
+	if (session && session_flags(session)->outgoing) {
+		/* Check if the pointer with our msgid points to our task. */
+		uint64_t msg_id = worker_task_pkt_get_msgid(task);
+		struct qr_task *other = session_tasklist_find_msgid(session, msg_id);
+		if (other != task)
+			return;
+
+		qr_task_ref(task);
+
+		struct kr_query* qry = task_get_last_pending_query(task);
+		VERBOSE_MSG(qry, "=> Query resolution TCP task timed out\n");
+		session_tasklist_finalize_expired(session);
+		session_tasklist_del(session, task);
+
+		if (qry)
+			qry->server_selection.error(qry, task->transport,
+					KR_SELECTION_DATA_TIMEOUT);
+
+		task->timeouts += 1;
+		task->ctx->worker->stats.timeout += 1;
+		qr_task_step(task, NULL, NULL);
+
+		qr_task_unref(task);
+	}
+}
+
 static int qr_task_step(struct qr_task *task,
 			const struct sockaddr *packet_source, knot_pkt_t *packet)
 {
@@ -1616,8 +1672,11 @@ static int qr_task_step(struct qr_task *task,
 	/* Close pending I/O requests */
 	subreq_finalize(task, packet_source, packet);
 	if ((kr_now() - worker_task_creation_time(task)) >= KR_RESOLVE_TIME_LIMIT) {
+		uv_timer_stop(&task->timeout);
 		return qr_task_finalize(task, KR_STATE_FAIL);
 	}
+
+	uv_timer_start(&task->timeout, &qr_task_timeout, KR_CONN_RTT_MAX / 2, 0);
 
 	/* Consume input and produce next query */
 	struct request_ctx *ctx = task->ctx;
@@ -1768,7 +1827,7 @@ int worker_submit(struct session *session,
 			return kr_error(ENOMEM);
 		}
 
-		task = qr_task_create(ctx);
+		task = qr_task_create(handle->loop, ctx);
 		if (!task) {
 			request_free(ctx);
 			return kr_error(ENOMEM);
@@ -2001,7 +2060,7 @@ struct qr_task *worker_resolve_start(knot_pkt_t *query, struct kr_qflags options
 		return NULL;
 
 	/* Create task */
-	struct qr_task *task = qr_task_create(ctx);
+	struct qr_task *task = qr_task_create(uv_default_loop(), ctx);
 	if (!task) {
 		request_free(ctx);
 		return NULL;
