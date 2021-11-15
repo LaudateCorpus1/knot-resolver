@@ -10,7 +10,7 @@ variables:
   RESPDIFF_COUNT: 1
   RESPDIFF_FORCE: 0
   RESPERF_FORCE: 0
-  KNOT_VERSION: '3.0'
+  KNOT_VERSION: '3.1'
   LIBKRES_ABI: 9
   LIBKRES_NAME: libkres
   MESON_TEST: meson test -C build_ci* -t 4 --print-errorlogs
@@ -132,7 +132,7 @@ build:macOS:
       - branches@knot/security/knot-resolver
   stage: build
   when: delayed
-  start_in: 1 minutes  # allow some time for mirrorring, job creation
+  start_in: 3 minutes  # allow some time for mirrorring, job creation
   script:
     - ci/gh_actions.py ${CI_COMMIT_REF_NAME} ${CI_COMMIT_SHA}
 
@@ -261,11 +261,12 @@ lint:tidy:
     - ninja -C build_ci_lib daemon/kresd
     - ninja -C build_ci_lib kres-gen
     - git diff --quiet || (git diff; exit 1)
-kres-gen-default:
+kres-gen-30:
   <<: *kres-gen
-kres-gen-master:
+  image: $CI_REGISTRY/knot/knot-resolver/ci/debian-11:knot-3.0
+kres-gen-31:
   <<: *kres-gen
-  image: $CI_REGISTRY/knot/knot-resolver/ci/debian-11:knot-master
+  image: $CI_REGISTRY/knot/knot-resolver/ci/debian-11:knot-3.1
 
 root.hints:
   <<: *sanity
@@ -605,13 +606,6 @@ obs:build:all:
     when:
       - script_failure
 
-obs:centos7:x86_64:
-  <<: *distrotest
-  variables:
-    OBS_REPO: knot-resolver-latest
-    DISTROTEST_NAME: centos7
-    DISTROTEST_REPO: CentOS_7_EPEL
-
 obs:centos8:x86_64:
   <<: *distrotest
   allow_failure: true
@@ -645,13 +639,6 @@ obs:debian11:x86_64:
     DISTROTEST_NAME: debian11
     DISTROTEST_REPO: Debian_11
 
-obs:fedora33:x86_64:
-  <<: *distrotest
-  variables:
-    OBS_REPO: knot-resolver-latest
-    DISTROTEST_NAME: fedora33
-    DISTROTEST_REPO: Fedora_33
-
 obs:fedora34:x86_64:
   <<: *distrotest
   variables:
@@ -659,12 +646,19 @@ obs:fedora34:x86_64:
     DISTROTEST_NAME: fedora34
     DISTROTEST_REPO: Fedora_34
 
+obs:fedora35:x86_64:
+  <<: *distrotest
+  variables:
+    OBS_REPO: knot-resolver-latest
+    DISTROTEST_NAME: fedora35
+    DISTROTEST_REPO: Fedora_35
+
 obs:leap15:x86_64:
   <<: *distrotest
   variables:
     OBS_REPO: knot-resolver-latest
     DISTROTEST_NAME: leap15
-    DISTROTEST_REPO: openSUSE_Leap_15.2
+    DISTROTEST_REPO: openSUSE_Leap_15.3
 
 obs:ubuntu1804:x86_64:
   <<: *distrotest
@@ -684,12 +678,12 @@ obs:ubuntu2004:x86_64:
     DISTROTEST_NAME: ubuntu2004
     DISTROTEST_REPO: xUbuntu_20.04
 
-obs:ubuntu2104:x86_64:
+obs:ubuntu2110:x86_64:
   <<: *distrotest
   variables:
     OBS_REPO: knot-resolver-latest
-    DISTROTEST_NAME: ubuntu2104
-    DISTROTEST_REPO: xUbuntu_21.04
+    DISTROTEST_NAME: ubuntu2110
+    DISTROTEST_REPO: xUbuntu_21.10
 
 .packagingtest: &packagingtest
   stage: pkgtest

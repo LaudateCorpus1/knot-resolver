@@ -219,7 +219,7 @@ struct kr_svldr_ctx * kr_svldr_new_ctx(const knot_rrset_t *ds, knot_rrset_t *dns
 		if (!kr_dnssec_key_zsk(krr->data) || kr_dnssec_key_revoked(krr->data))
 			continue; // key not usable for this
 		kr_svldr_key_t key;
-		if (unlikely(svldr_key_new(krr, NULL/*FIXME?*/, &key) != 0))
+		if (unlikely(svldr_key_new(krr, NULL/*seems OK here*/, &key) != 0))
 			goto fail;
 		array_push(ctx->keys, key);
 	}
@@ -236,11 +236,14 @@ static int kr_svldr_rrset_with_key(knot_rrset_t *rrs, const knot_rdataset_t *rrs
 				- knot_dname_is_wildcard(rrs->owner);
 	knot_rdata_t *rdata_j = rrsigs->rdata;
 	for (uint16_t j = 0; j < rrsigs->count; ++j, rdata_j = knot_rdataset_next(rdata_j)) {
+		if (kr_fails_assert(knot_rrsig_type_covered(rdata_j) == rrs->type))
+			continue; //^^ not a problem but no reason to allow them in the API
 		int val_flgs = 0;
 		int retv = validate_rrsig_rr(&val_flgs, covered_labels, rdata_j,
 						key->alg, key->tag, vctx);
 		if (retv == kr_error(EAGAIN)) {
-			return vctx->result = retv;
+			vctx->result = retv;
+			return vctx->result;
 		} else if (retv != 0) {
 			continue;
 		}
@@ -249,19 +252,23 @@ static int kr_svldr_rrset_with_key(knot_rrset_t *rrs, const knot_rdataset_t *rrs
 		const int trim_labels = (val_flgs & FLG_WILDCARD_EXPANSION) ? 1 : 0;
 		if (kr_check_signature(rdata_j, key->key, rrs, trim_labels) == 0) {
 			trim_ttl(rrs, rdata_j, vctx->timestamp, vctx->log_qry);
-			return vctx->result = kr_ok();
+			vctx->result = kr_ok();
+			return vctx->result;
 		} else {
 			vctx->rrs_counters.crypto_invalid++;
 		}
 	}
-	return vctx->result = kr_error(ENOENT);
+	vctx->result = kr_error(ENOENT);
+	return vctx->result;
 }
 /* The implementation basically performs "parts of" kr_rrset_validate(). */
 int kr_svldr_rrset(knot_rrset_t *rrs, const knot_rdataset_t *rrsigs,
 			struct kr_svldr_ctx *ctx)
 {
-	if (knot_dname_in_bailiwick(rrs->owner, ctx->vctx.zone_name) < 0)
-		return ctx->vctx.result = kr_error(EAGAIN);
+	if (knot_dname_in_bailiwick(rrs->owner, ctx->vctx.zone_name) < 0) {
+		ctx->vctx.result = kr_error(EAGAIN);
+		return ctx->vctx.result;
+	}
 	for (ssize_t i = 0; i < ctx->keys.len; ++i) {
 		kr_svldr_rrset_with_key(rrs, rrsigs, &ctx->vctx, &ctx->keys.at[i]);
 		if (ctx->vctx.result == 0)
@@ -292,7 +299,8 @@ static int kr_rrset_validate_with_key(kr_rrset_validation_ctx_t *vctx,
 	struct dnssec_key *created_key = NULL;
 
 	if (!knot_dname_is_equal(keys->owner, zone_name)
-	   /* It's just caller's approximation that the RR is in that particular zone.
+	   /* It's just caller's approximation that the RR is in that particular zone,
+	    * so we verify that in the following condition.
 	    * We MUST guard against attempts of zones signing out-of-bailiwick records. */
 	    || knot_dname_in_bailiwick(covered->owner, zone_name) < 0) {
 		vctx->result = kr_error(ENOENT);
@@ -422,10 +430,10 @@ int kr_dnskeys_trusted(kr_rrset_validation_ctx_t *vctx, const knot_rdataset_t *s
 			continue;
 
 		kr_svldr_key_t key;
-		int ret = svldr_key_new(krr, keys->owner, &key);
-		if (ret) return kr_error(ret);
+		if (svldr_key_new(krr, keys->owner, &key) != 0)
+			continue; // it might e.g. be malformed
 
-		ret = kr_authenticate_referral(ta, key.key);
+		int ret = kr_authenticate_referral(ta, key.key);
 		if (ret == 0)
 			ret = kr_svldr_rrset_with_key(keys, sigs, vctx, &key);
 		svldr_key_del(&key);

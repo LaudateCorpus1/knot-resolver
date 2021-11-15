@@ -1,4 +1,13 @@
-Knot Resolver 5.4.2 (2021-0m-dd)
+Knot Resolver 5.4.3 (2021-mm-dd)
+================================
+
+Bugfixes
+--------
+- policy.rpz: improve logs, fix origin detection in files without $ORIGIN
+- lua: log() works again; broken in 5.4.2 (!1223)
+
+
+Knot Resolver 5.4.2 (2021-10-13)
 ================================
 
 Improvements
@@ -6,10 +15,12 @@ Improvements
 - dns64 module: also map the reverse (PTR) subtree (#478, !1201)
 - dns64 module: allow disabling based on client address (#368, !1201)
 - dns64 module: allow configuring AAAA subnets not allowed in answer (!1201)
+- nameserver selection algorithm: improve IPv6 avoidance if broken (!1207)
 
 Bugfixes
 --------
 - lua: log() output is visible with default log level again (!1208)
+- build: fix when knot-dns headers are on non-standard location (!1210)
 
 
 Knot Resolver 5.4.1 (2021-08-19)
@@ -59,6 +70,7 @@ Security
 --------
 - validator: fix 5.3.1 regression on over-limit NSEC3 edge case (!1169)
   Assertion might be triggered by query/answer, potentially DoS.
+  CVE-2021-40083 was later assigned.
 
 Improvements
 ------------
